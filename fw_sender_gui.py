@@ -1,0 +1,1040 @@
+"""
+S-Board Firmware Updater - Professional GUI
+============================================
+Fully-configurable front-end for fw_sender.py with Manual + Auto modes.
+
+Run:
+    pip install python-can customtkinter
+    python fw_sender_gui.py
+"""
+from __future__ import annotations
+
+import io, json, queue, re, struct, sys, threading, time, zlib
+import tkinter as tk
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from tkinter import filedialog, messagebox
+from typing import Any
+
+import can
+import customtkinter as ctk
+import fw_sender
+
+# ═══════════════ Abort infrastructure ═══════════════════════════
+class _TransferAborted(Exception):
+    pass
+
+class _AbortableBus:
+    def __init__(self, real_bus: can.BusABC, evt: threading.Event):
+        self._bus = real_bus
+        self._abort = evt
+    def __getattr__(self, n: str):
+        return getattr(self._bus, n)
+    def send(self, msg, timeout=None):
+        if self._abort.is_set(): raise _TransferAborted()
+        return self._bus.send(msg, timeout=timeout)
+    def recv(self, timeout=None):
+        if self._abort.is_set(): raise _TransferAborted()
+        if timeout is None or timeout > 0.25:
+            deadline = time.monotonic() + (timeout if timeout else 1e9)
+            while time.monotonic() < deadline:
+                if self._abort.is_set(): raise _TransferAborted()
+                m = self._bus.recv(timeout=min(deadline - time.monotonic(), 0.25))
+                if m is not None: return m
+            return None
+        return self._bus.recv(timeout=timeout)
+    def shutdown(self):
+        self._bus.shutdown()
+
+# ═══════════════ Stdout fan-out ═════════════════════════════════
+class _QueueWriter(io.TextIOBase):
+    def __init__(self, q): self._q, self._buf = q, ""
+    def write(self, s):
+        if not s: return 0
+        self._buf += s
+        while True:
+            n, r = self._buf.find("\n"), self._buf.find("\r")
+            if n < 0 and r < 0: break
+            idx = min(x for x in (n,r) if x >= 0)
+            self._q.put(self._buf[:idx+1]); self._buf = self._buf[idx+1:]
+        return len(s)
+    def flush(self):
+        if self._buf: self._q.put(self._buf); self._buf = ""
+
+# ═══════════════ Settings ═══════════════════════════════════════
+SETTINGS_PATH = Path(__file__).with_name("fw_sender_gui_settings.json")
+
+@dataclass
+class FwSettings:
+    bin_path: str = r"D:\GEN3\S board\adc_ex2_soc_epwm\CPU1_FLASH\adc_ex2_soc_epwm.bin"
+    version: int = 11
+    pcan_channel: str = "PCAN_USBBUS1"
+    f_clock_mhz: int = 30
+    nom_brp: int = 12; nom_tseg1: int = 3; nom_tseg2: int = 1; nom_sjw: int = 1
+    data_brp: int = 3; data_tseg1: int = 3; data_tseg2: int = 1; data_sjw: int = 1
+    cmd_can_id: int = 7; data_can_id: int = 6; resp_can_id: int = 8
+    cmd_fw_start: int = 0x30; cmd_fw_header: int = 0x31; cmd_fw_complete: int = 0x33
+    resp_fw_ack: int = 0x25; resp_fw_nak: int = 0x26
+    resp_fw_crc_pass: int = 0x27; resp_fw_crc_fail: int = 0x28
+    burst_size: int = 16; data_frame_size: int = 64
+    ack_timeout: float = 2.0; erase_timeout: float = 15.0; verify_timeout: float = 10.0
+    inter_frame_delay_ms: float = 1.0; max_retries: int = 3
+    header_magic: int = 0x4601; header_image_type: int = 0x0001
+    header_dest_bank: int = 0x0C0000; header_entry_point: int = 0x082000
+    appearance: str = "Dark"; color_theme: str = "blue"
+    # Manual mode
+    manual_single_frame: bool = False  # send one frame at a time
+    manual_burst_pause_ms: int = 0     # pause between bursts (0=no pause)
+
+    def save(self, p=SETTINGS_PATH):
+        p.write_text(json.dumps(asdict(self), indent=2))
+    @classmethod
+    def load(cls, p=SETTINGS_PATH):
+        if not p.exists(): return cls()
+        try:
+            raw = json.loads(p.read_text())
+        except Exception: return cls()
+        valid = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in valid})
+
+def apply_settings(s: FwSettings):
+    for attr in ('PCAN_CHANNEL','CMD_CAN_ID','DATA_CAN_ID','RESP_CAN_ID',
+                 'CMD_FW_START','CMD_FW_HEADER','CMD_FW_COMPLETE',
+                 'RESP_FW_ACK','RESP_FW_NAK','RESP_FW_CRC_PASS','RESP_FW_CRC_FAIL',
+                 'BURST_SIZE','DATA_FRAME_SIZE','ACK_TIMEOUT','ERASE_TIMEOUT',
+                 'VERIFY_TIMEOUT','MAX_RETRIES'):
+        if attr == 'PCAN_CHANNEL': setattr(fw_sender, attr, s.pcan_channel)
+        else: setattr(fw_sender, attr, getattr(s, attr.lower()))
+    fw_sender.INTER_FRAME_DELAY = s.inter_frame_delay_ms / 1000.0
+    fw_sender.PCAN_FD_PARAMS = dict(
+        f_clock_mhz=s.f_clock_mhz,
+        nom_brp=s.nom_brp, nom_tseg1=s.nom_tseg1, nom_tseg2=s.nom_tseg2, nom_sjw=s.nom_sjw,
+        data_brp=s.data_brp, data_tseg1=s.data_tseg1, data_tseg2=s.data_tseg2, data_sjw=s.data_sjw)
+
+# ═══════════════ Labeled entry widget ═══════════════════════════
+class LE(ctk.CTkFrame):
+    def __init__(self, master, label, var, *, unit="", tip="", w=140):
+        super().__init__(master, fg_color="transparent")
+        self.grid_columnconfigure(0, weight=1)
+        r = 0
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=r, column=0, sticky="ew"); r += 1
+        top.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(top, text=label, anchor="w",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, sticky="w", padx=2)
+        if unit:
+            ctk.CTkLabel(top, text=unit, anchor="e", text_color=("#666","#888"),
+                         font=ctk.CTkFont(size=11)).grid(row=0, column=1, sticky="e", padx=2)
+        ctk.CTkEntry(self, textvariable=var, width=w, height=30).grid(row=r, column=0, sticky="ew", pady=(2,0)); r += 1
+        if tip:
+            ctk.CTkLabel(self, text=tip, anchor="w", text_color=("#888","#777"),
+                         font=ctk.CTkFont(size=10)).grid(row=r, column=0, sticky="ew", padx=2)
+
+# ═══════════════ Main App ══════════════════════════════════════
+class App(ctk.CTk):
+    BURST_RE = re.compile(r"Burst\s+(\d+)\s*/\s*(\d+).*?(\d+)%.*?\(([\d.]+)s\)")
+
+    def __init__(self):
+        super().__init__()
+        self.settings = FwSettings.load()
+        ctk.set_appearance_mode(self.settings.appearance)
+        ctk.set_default_color_theme(self.settings.color_theme)
+        self.title("S-Board Firmware Updater"); self.geometry("1200x820"); self.minsize(1000, 720)
+        self.vars = self._mk_vars()
+        self._q: queue.Queue[str] = queue.Queue()
+        self._worker: threading.Thread|None = None
+        self._abort = threading.Event()
+        self._manual_bus: can.BusABC|None = None
+        self._build(); self.after(60, self._drain)
+        self.protocol("WM_DELETE_WINDOW", self._on_quit)
+
+    def _mk_vars(self):
+        out = {}
+        for f in fields(FwSettings):
+            v = getattr(self.settings, f.name)
+            if isinstance(v, bool): out[f.name] = tk.BooleanVar(value=v)
+            elif isinstance(v, int): out[f.name] = tk.IntVar(value=v)
+            elif isinstance(v, float): out[f.name] = tk.DoubleVar(value=v)
+            else: out[f.name] = tk.StringVar(value=str(v))
+        return out
+
+    def _v2s(self):
+        kw = {}
+        for f in fields(FwSettings):
+            v = self.vars[f.name].get()
+            try:
+                if f.type in ("int", int): kw[f.name] = int(v,0) if isinstance(v,str) else int(v)
+                elif f.type in ("float", float): kw[f.name] = float(v)
+                elif f.type in ("bool", bool): kw[f.name] = bool(v)
+                else: kw[f.name] = v
+            except: kw[f.name] = getattr(self.settings, f.name)
+        return FwSettings(**kw)
+
+    # ═══════════ Layout ════════════════════════════════════════
+    def _build(self):
+        self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(2, weight=1)
+        self._build_header()
+        self._build_transfer_card()
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0,8))
+        body.grid_columnconfigure(0, weight=1); body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+        self._build_tabs(body)
+        self._build_log(body)
+        self._build_status()
+
+    def _build_header(self):
+        h = ctk.CTkFrame(self, height=56, corner_radius=0)
+        h.grid(row=0, column=0, sticky="ew"); h.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(h, text="  S-Board Firmware Updater",
+                     font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=20, pady=12, sticky="w")
+        ctk.CTkLabel(h, text="CAN-FD OTA", text_color=("#666","#999"),
+                     font=ctk.CTkFont(size=12)).grid(row=0, column=1, sticky="w", pady=(18,0))
+        r = ctk.CTkFrame(h, fg_color="transparent"); r.grid(row=0, column=2, padx=16, pady=10, sticky="e")
+        ctk.CTkLabel(r, text="Theme:", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0,6))
+        self.theme_menu = ctk.CTkOptionMenu(r, values=["Dark","Light","System"],
+                                             command=lambda c: ctk.set_appearance_mode(c), width=100)
+        self.theme_menu.set(self.settings.appearance); self.theme_menu.pack(side="left")
+
+    def _build_transfer_card(self):
+        c = ctk.CTkFrame(self, corner_radius=10)
+        c.grid(row=1, column=0, sticky="ew", padx=16, pady=(8,8)); c.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(c, text="Firmware (.bin)", font=ctk.CTkFont(size=12, weight="bold")
+                     ).grid(row=0, column=0, padx=(16,8), pady=(14,4), sticky="w")
+        ctk.CTkEntry(c, textvariable=self.vars["bin_path"], height=34
+                     ).grid(row=0, column=1, sticky="ew", pady=(14,4))
+        ctk.CTkButton(c, text="Browse...", width=90, height=34, command=self._browse
+                      ).grid(row=0, column=2, padx=(8,8), pady=(14,4))
+        self.file_info = tk.StringVar(value="")
+        ctk.CTkLabel(c, textvariable=self.file_info, text_color=("#666","#888"),
+                     font=ctk.CTkFont(size=11)).grid(row=1, column=1, columnspan=2, sticky="w")
+        self.vars["bin_path"].trace_add("write", lambda *_: self._refresh_info())
+        self._refresh_info()
+        ctk.CTkLabel(c, text="Version", font=ctk.CTkFont(size=12, weight="bold")
+                     ).grid(row=2, column=0, padx=(16,8), pady=(8,14), sticky="w")
+        ctk.CTkEntry(c, textvariable=self.vars["version"], width=100, height=34
+                     ).grid(row=2, column=1, sticky="w", pady=(8,14))
+        btns = ctk.CTkFrame(c, fg_color="transparent")
+        btns.grid(row=2, column=2, padx=(8,16), pady=(8,14), sticky="e")
+        self.abort_btn = ctk.CTkButton(btns, text="Abort", width=90, height=38,
+            fg_color=("#b33","#a33"), hover_color=("#d44","#c44"),
+            font=ctk.CTkFont(size=13, weight="bold"), command=self._on_abort, state="disabled")
+        self.abort_btn.pack(side="right", padx=(8,0))
+        self.send_btn = ctk.CTkButton(btns, text="Send Firmware", width=170, height=38,
+            font=ctk.CTkFont(size=13, weight="bold"), command=self._on_send)
+        self.send_btn.pack(side="right")
+
+    # ═══════════ Tabs ══════════════════════════════════════════
+    def _build_tabs(self, parent):
+        tabs = ctk.CTkTabview(parent, corner_radius=10)
+        tabs.grid(row=0, column=0, sticky="nsew", padx=(0,8))
+        for n in ("Manual Control", "MCU Operations", "CAN Monitor", "CAN Bus", "Protocol", "Timing", "Header", "Settings"):
+            tabs.add(n)
+        self._build_manual_tab(tabs.tab("Manual Control"))
+        self._build_mcu_tab(tabs.tab("MCU Operations"))
+        self._build_monitor_tab(tabs.tab("CAN Monitor"))
+        self._build_can_tab(tabs.tab("CAN Bus"))
+        self._build_protocol_tab(tabs.tab("Protocol"))
+        self._build_timing_tab(tabs.tab("Timing"))
+        self._build_header_tab(tabs.tab("Header"))
+        self._build_settings_tab(tabs.tab("Settings"))
+
+    def _build_manual_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True)
+        s.grid_columnconfigure(0, weight=1)
+
+        self._sec(s, "CONNECTION").grid(row=0, column=0, sticky="ew", pady=(0,6))
+        cf = ctk.CTkFrame(s, fg_color="transparent")
+        cf.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
+        self.conn_btn = ctk.CTkButton(cf, text="Connect PCAN", width=160, height=34,
+                                       command=self._manual_connect)
+        self.conn_btn.pack(side="left", padx=(0,8))
+        self.disconn_btn = ctk.CTkButton(cf, text="Disconnect", width=120, height=34,
+                                          state="disabled", command=self._manual_disconnect,
+                                          fg_color=("#666","#444"), hover_color=("#777","#555"))
+        self.disconn_btn.pack(side="left")
+        self.conn_status = tk.StringVar(value="Disconnected")
+        ctk.CTkLabel(cf, textvariable=self.conn_status, text_color=("#a33","#f66"),
+                     font=ctk.CTkFont(size=12)).pack(side="left", padx=12)
+
+        self._sec(s, "STEP-BY-STEP OTA").grid(row=2, column=0, sticky="ew", pady=(14,6))
+        info = ctk.CTkLabel(s, text=(
+            "Run each step individually. The S-Board responds on CAN.\n"
+            "All timeouts / IDs / codes use the values from the other tabs."),
+            text_color=("#888","#aaa"), font=ctk.CTkFont(size=11), justify="left")
+        info.grid(row=3, column=0, sticky="ew", padx=8, pady=(0,8))
+
+        steps = [
+            ("1. Erase Bank 2",     "Send CMD_FW_START. S-Board erases 128 sectors of Bank 2.\n"
+                                     "Waits up to [erase_timeout] seconds for ACK.",
+             self._manual_start),
+            ("2. Send Header",      "Send CMD_FW_HEADER with image size, CRC, version.\n"
+                                     "S-Board parses and ACKs.",
+             self._manual_header),
+            ("3. Stream Data",      "Send firmware data frames in bursts of [burst_size].\n"
+                                     "ACK after each burst. Retries up to [max_retries].",
+             self._manual_data),
+            ("4. Verify CRC",       "Send CMD_FW_COMPLETE. S-Board computes CRC32 over Bank 2.\n"
+                                     "Returns CRC_PASS or CRC_FAIL.",
+             self._manual_complete),
+            ("5. Send Single Frame","Send exactly ONE data frame (next in sequence).\n"
+                                     "For debugging byte-level issues.",
+             self._manual_one_frame),
+        ]
+        self._manual_btns = []
+        for i, (title, desc, cmd) in enumerate(steps):
+            row = 4 + i * 2
+            bf = ctk.CTkFrame(s, corner_radius=8)
+            bf.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
+            bf.grid_columnconfigure(1, weight=1)
+            btn = ctk.CTkButton(bf, text=title, width=200, height=36, command=cmd,
+                                font=ctk.CTkFont(size=12, weight="bold"))
+            btn.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+            ctk.CTkLabel(bf, text=desc, justify="left", text_color=("#666","#aaa"),
+                         font=ctk.CTkFont(size=11), wraplength=350).grid(
+                row=0, column=1, padx=(0,10), pady=10, sticky="w")
+            self._manual_btns.append(btn)
+
+        # Manual state
+        self._manual_padded = None
+        self._manual_total_frames = 0
+        self._manual_frame_idx = 0
+
+        self._sec(s, "MANUAL DATA STATUS").grid(row=14, column=0, sticky="ew", pady=(14,6))
+        self.manual_data_status = tk.StringVar(value="No data loaded.")
+        ctk.CTkLabel(s, textvariable=self.manual_data_status,
+                     font=ctk.CTkFont(size=12)).grid(row=15, column=0, sticky="ew", padx=8)
+
+    def _build_mcu_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True); s.grid_columnconfigure(0, weight=1)
+
+        self._sec(s, "BOOT FLAG (Bank 3, 0x0E0000)").grid(row=0, column=0, sticky="ew", pady=(0,6))
+        bf = ctk.CTkFrame(s, fg_color="transparent")
+        bf.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
+        ctk.CTkButton(bf, text="Read Boot Flag", width=160, height=34,
+                      command=self._mcu_read_flag).pack(side="left", padx=(0,8))
+        ctk.CTkButton(bf, text="Clear Boot Flag", width=160, height=34,
+                      command=self._mcu_clear_flag,
+                      fg_color=("#a55","#a44"), hover_color=("#c66","#c55")).pack(side="left", padx=(0,8))
+        ctk.CTkButton(bf, text="Write Boot Flag", width=160, height=34,
+                      command=self._mcu_write_flag).pack(side="left")
+
+        self._sec(s, "FLASH OPERATIONS").grid(row=2, column=0, sticky="ew", pady=(14,6))
+        ff = ctk.CTkFrame(s, corner_radius=8)
+        ff.grid(row=3, column=0, sticky="ew", padx=4, pady=4)
+        ff.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(ff, text="Address (hex):", font=ctk.CTkFont(size=12)).grid(
+            row=0, column=0, padx=(10,4), pady=8, sticky="w")
+        self.mcu_addr_var = tk.StringVar(value="0x0E0000")
+        ctk.CTkEntry(ff, textvariable=self.mcu_addr_var, width=160, height=32).grid(
+            row=0, column=1, padx=4, pady=8, sticky="w")
+        fb = ctk.CTkFrame(ff, fg_color="transparent")
+        fb.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0,8))
+        ctk.CTkButton(fb, text="Read 8 Words", width=140, height=34,
+                      command=self._mcu_read_flash).pack(side="left", padx=4)
+        ctk.CTkButton(fb, text="Erase Sector", width=140, height=34,
+                      command=self._mcu_erase_sector,
+                      fg_color=("#a55","#a44"), hover_color=("#c66","#c55")).pack(side="left", padx=4)
+
+        self._sec(s, "CRC VERIFICATION").grid(row=4, column=0, sticky="ew", pady=(14,6))
+        cf = ctk.CTkFrame(s, corner_radius=8)
+        cf.grid(row=5, column=0, sticky="ew", padx=4, pady=4)
+        cf.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(cf, text="Start addr:", font=ctk.CTkFont(size=12)).grid(
+            row=0, column=0, padx=(10,4), pady=4, sticky="w")
+        self.mcu_crc_addr = tk.StringVar(value="0x0C0000")
+        ctk.CTkEntry(cf, textvariable=self.mcu_crc_addr, width=140, height=32).grid(
+            row=0, column=1, padx=4, pady=4, sticky="w")
+        ctk.CTkLabel(cf, text="Size (bytes):", font=ctk.CTkFont(size=12)).grid(
+            row=1, column=0, padx=(10,4), pady=4, sticky="w")
+        self.mcu_crc_size = tk.StringVar(value="0")
+        ctk.CTkEntry(cf, textvariable=self.mcu_crc_size, width=140, height=32).grid(
+            row=1, column=1, padx=4, pady=4, sticky="w")
+        ctk.CTkButton(cf, text="Compute CRC32", width=160, height=34,
+                      command=self._mcu_compute_crc).grid(
+            row=2, column=0, columnspan=2, padx=10, pady=(4,8), sticky="w")
+
+        self._sec(s, "DEVICE CONTROL").grid(row=6, column=0, sticky="ew", pady=(14,6))
+        df = ctk.CTkFrame(s, fg_color="transparent")
+        df.grid(row=7, column=0, sticky="ew", padx=4, pady=4)
+        ctk.CTkButton(df, text="Get State", width=140, height=34,
+                      command=self._mcu_get_state).pack(side="left", padx=(0,8))
+        ctk.CTkButton(df, text="Reset Device", width=160, height=34,
+                      command=self._mcu_reset,
+                      fg_color=("#a55","#a44"), hover_color=("#c66","#c55")).pack(side="left", padx=(0,8))
+
+        self._sec(s, "RAW CAN FRAME").grid(row=8, column=0, sticky="ew", pady=(14,6))
+        rf = ctk.CTkFrame(s, corner_radius=8)
+        rf.grid(row=9, column=0, sticky="ew", padx=4, pady=4)
+        rf.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(rf, text="CAN ID:", font=ctk.CTkFont(size=12)).grid(
+            row=0, column=0, padx=(10,4), pady=4, sticky="w")
+        self.raw_id_var = tk.StringVar(value="7")
+        ctk.CTkEntry(rf, textvariable=self.raw_id_var, width=80, height=32).grid(
+            row=0, column=1, padx=4, pady=4, sticky="w")
+        ctk.CTkLabel(rf, text="Data (hex):", font=ctk.CTkFont(size=12)).grid(
+            row=1, column=0, padx=(10,4), pady=4, sticky="w")
+        self.raw_data_var = tk.StringVar(value="30 01 00 00")
+        ctk.CTkEntry(rf, textvariable=self.raw_data_var, width=400, height=32).grid(
+            row=1, column=1, padx=4, pady=4, sticky="ew")
+        ctk.CTkLabel(rf, text="64-byte CAN-FD frame. Pad with 00.", text_color=("#888","#777"),
+                     font=ctk.CTkFont(size=10)).grid(row=2, column=1, padx=4, sticky="w")
+        ctk.CTkButton(rf, text="Send Raw Frame", width=160, height=34,
+                      command=self._mcu_send_raw).grid(
+            row=3, column=0, columnspan=2, padx=10, pady=(4,8), sticky="w")
+
+    def _build_monitor_tab(self, tab):
+        s = ctk.CTkFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True)
+        s.grid_rowconfigure(1, weight=1); s.grid_columnconfigure(0, weight=1)
+        top = ctk.CTkFrame(s, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8,4))
+        self.monitor_btn = ctk.CTkButton(top, text="Start Monitor", width=140, height=34,
+                                          command=self._monitor_toggle)
+        self.monitor_btn.pack(side="left", padx=(0,8))
+        ctk.CTkButton(top, text="Clear", width=80, height=34, command=self._monitor_clear,
+                      fg_color=("#666","#444"), hover_color=("#777","#555")).pack(side="left")
+        self.monitor_status = tk.StringVar(value="Stopped")
+        ctk.CTkLabel(top, textvariable=self.monitor_status, font=ctk.CTkFont(size=12)).pack(side="left", padx=12)
+        self.monitor_text = tk.Text(s, wrap="none", relief="flat", borderwidth=0,
+                                     bg="#0e1116", fg="#d6dde6", font=("Consolas", 10))
+        self.monitor_text.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0,8))
+        self.monitor_text.tag_config("rx", foreground="#69b1ff")
+        self.monitor_text.tag_config("tx", foreground="#7adf7a")
+        self.monitor_text.tag_config("hdr", foreground="#f1c40f")
+        self.monitor_text.configure(state="disabled")
+        self._monitoring = False
+        self._monitor_thread = None
+
+    def _build_can_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True); s.grid_columnconfigure((0,1), weight=1)
+        self._sec(s, "PCAN ADAPTER").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,6))
+        ctk.CTkLabel(s, text="Channel", anchor="w").grid(row=1, column=0, sticky="w", padx=4)
+        ctk.CTkComboBox(s, variable=self.vars["pcan_channel"],
+                        values=[f"PCAN_USBBUS{i}" for i in range(1,9)], width=200
+                        ).grid(row=1, column=1, sticky="w", padx=4, pady=(0,8))
+        self._sec(s, "BIT TIMING").grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8,6))
+        LE(s, "Clock", self.vars["f_clock_mhz"], unit="MHz").grid(row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
+        nc = self._card(s, "Nominal"); nc.grid(row=4, column=0, sticky="nsew", padx=4, pady=4)
+        LE(nc, "BRP", self.vars["nom_brp"]).grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        LE(nc, "TSEG1", self.vars["nom_tseg1"]).grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        LE(nc, "TSEG2", self.vars["nom_tseg2"]).grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        LE(nc, "SJW", self.vars["nom_sjw"]).grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        nc.grid_columnconfigure((0,1), weight=1)
+        dc = self._card(s, "Data (BRS)"); dc.grid(row=4, column=1, sticky="nsew", padx=4, pady=4)
+        LE(dc, "BRP", self.vars["data_brp"]).grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        LE(dc, "TSEG1", self.vars["data_tseg1"]).grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        LE(dc, "TSEG2", self.vars["data_tseg2"]).grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        LE(dc, "SJW", self.vars["data_sjw"]).grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        dc.grid_columnconfigure((0,1), weight=1)
+        self.bitrate_var = tk.StringVar()
+        ctk.CTkLabel(s, textvariable=self.bitrate_var, text_color=("#357","#7af"),
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(10,6))
+        for n in ("f_clock_mhz","nom_brp","nom_tseg1","nom_tseg2","data_brp","data_tseg1","data_tseg2"):
+            self.vars[n].trace_add("write", lambda *_: self._upd_br())
+        self._upd_br()
+
+    def _build_protocol_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True); s.grid_columnconfigure((0,1,2), weight=1)
+        self._sec(s, "CAN IDs").grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0,6))
+        LE(s, "Command (PC->MCU)", self.vars["cmd_can_id"]).grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "Data (PC->MCU)", self.vars["data_can_id"]).grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        LE(s, "Response (MCU->PC)", self.vars["resp_can_id"]).grid(row=1, column=2, padx=4, pady=4, sticky="ew")
+        self._sec(s, "COMMAND CODES (hex OK)").grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12,6))
+        LE(s, "FW_START", self.vars["cmd_fw_start"]).grid(row=3, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "FW_HEADER", self.vars["cmd_fw_header"]).grid(row=3, column=1, padx=4, pady=4, sticky="ew")
+        LE(s, "FW_COMPLETE", self.vars["cmd_fw_complete"]).grid(row=3, column=2, padx=4, pady=4, sticky="ew")
+        self._sec(s, "RESPONSE CODES").grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12,6))
+        LE(s, "ACK", self.vars["resp_fw_ack"]).grid(row=5, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "NAK", self.vars["resp_fw_nak"]).grid(row=5, column=1, padx=4, pady=4, sticky="ew")
+        LE(s, "CRC PASS", self.vars["resp_fw_crc_pass"]).grid(row=5, column=2, padx=4, pady=4, sticky="ew")
+        LE(s, "CRC FAIL", self.vars["resp_fw_crc_fail"]).grid(row=6, column=0, padx=4, pady=4, sticky="ew")
+
+    def _build_timing_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True); s.grid_columnconfigure((0,1), weight=1)
+        self._sec(s, "BURST & FRAME").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,6))
+        LE(s, "Burst size", self.vars["burst_size"], unit="frames",
+           tip="ACK requested after every N data frames.").grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "Frame size", self.vars["data_frame_size"], unit="bytes",
+           tip="CAN-FD payload (64 for full FD).").grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        LE(s, "Inter-frame delay", self.vars["inter_frame_delay_ms"], unit="ms",
+           tip="Pause between frames so MCU ISR drains RX buffer.").grid(row=2, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "Max retries", self.vars["max_retries"], unit="per burst",
+           tip="Failed burst retransmission attempts.").grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+        self._sec(s, "TIMEOUTS").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12,6))
+        LE(s, "ACK timeout", self.vars["ack_timeout"], unit="s").grid(row=4, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "Erase timeout", self.vars["erase_timeout"], unit="s",
+           tip="128 sectors, can take >5s.").grid(row=4, column=1, padx=4, pady=4, sticky="ew")
+        LE(s, "Verify timeout", self.vars["verify_timeout"], unit="s",
+           tip="CRC32 over full image.").grid(row=5, column=0, padx=4, pady=4, sticky="ew")
+        self._sec(s, "MANUAL MODE").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12,6))
+        LE(s, "Burst pause", self.vars["manual_burst_pause_ms"], unit="ms",
+           tip="Extra pause between bursts in manual data step (0=none).").grid(row=7, column=0, padx=4, pady=4, sticky="ew")
+
+    def _build_header_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True); s.grid_columnconfigure((0,1), weight=1)
+        self._sec(s, "IMAGE HEADER (CMD_FW_HEADER payload)").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,6))
+        LE(s, "Magic", self.vars["header_magic"], tip="0x4601 - must match firmware parser.").grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "Image type", self.vars["header_image_type"], tip="0x0001 = S-Board.").grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        LE(s, "Dest bank", self.vars["header_dest_bank"], unit="addr", tip="0x0C0000 = Bank 2.").grid(row=2, column=0, padx=4, pady=4, sticky="ew")
+        LE(s, "Entry point", self.vars["header_entry_point"], unit="addr", tip="0x082000 (sector 8).").grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+
+    def _build_settings_tab(self, tab):
+        w = ctk.CTkFrame(tab, fg_color="transparent"); w.pack(fill="both", expand=True, padx=8, pady=8)
+        ctk.CTkLabel(w, text="S-Board Firmware Updater", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", pady=(0,4))
+        ctk.CTkLabel(w, text=f"Settings: {SETTINGS_PATH}\nHex values OK in numeric fields (0x30).",
+                     justify="left", font=ctk.CTkFont(size=12)).pack(anchor="w")
+        br = ctk.CTkFrame(w, fg_color="transparent"); br.pack(anchor="w", pady=(16,0))
+        ctk.CTkButton(br, text="Save Settings", width=150, command=self._save).pack(side="left", padx=(0,8))
+        ctk.CTkButton(br, text="Reset Defaults", width=160, command=self._reset,
+                      fg_color=("#a55","#a44"), hover_color=("#c66","#c55")).pack(side="left")
+
+    # ═══════════ Log ═══════════════════════════════════════════
+    def _build_log(self, parent):
+        lc = ctk.CTkFrame(parent, corner_radius=10)
+        lc.grid(row=0, column=1, sticky="nsew", padx=(8,0))
+        lc.grid_rowconfigure(1, weight=1); lc.grid_columnconfigure(0, weight=1)
+        hdr = ctk.CTkFrame(lc, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10,4)); hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text="Transfer Log", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(hdr, text="Clear", width=70, height=26, command=self._clear_log,
+                      fg_color=("#666","#444"), hover_color=("#777","#555")).grid(row=0, column=1, sticky="e")
+        self.log = tk.Text(lc, wrap="none", relief="flat", borderwidth=0, bg="#0e1116", fg="#d6dde6",
+                           insertbackground="#fff", font=("Consolas", 10))
+        self.log.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0,12))
+        for t, c in [("ok","#7adf7a"),("err","#ff6b6b"),("warn","#f1c40f"),("info","#69b1ff"),("muted","#7d8590")]:
+            self.log.tag_config(t, foreground=c)
+        self.log.configure(state="disabled")
+
+    def _build_status(self):
+        bar = ctk.CTkFrame(self, height=80, corner_radius=0)
+        bar.grid(row=3, column=0, sticky="ew"); bar.grid_columnconfigure(0, weight=1)
+        self.state_var = tk.StringVar(value="Idle."); self.detail_var = tk.StringVar(value="")
+        top = ctk.CTkFrame(bar, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=20, pady=(10,2)); top.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(top, textvariable=self.state_var, font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(top, textvariable=self.detail_var, text_color=("#666","#aaa"),
+                     font=ctk.CTkFont(size=12)).grid(row=0, column=1, sticky="e")
+        self.pb = ctk.CTkProgressBar(bar, height=14, corner_radius=4); self.pb.set(0)
+        self.pb.grid(row=1, column=0, sticky="ew", padx=20, pady=(2,14))
+
+    # ═══════════ Helpers ═══════════════════════════════════════
+    def _sec(self, p, t):
+        return ctk.CTkLabel(p, text=t, anchor="w", font=ctk.CTkFont(size=11, weight="bold"),
+                            text_color=("#357","#7af"))
+    def _card(self, p, t):
+        f = ctk.CTkFrame(p, corner_radius=8)
+        ctk.CTkLabel(f, text=t, anchor="w", font=ctk.CTkFont(size=12, weight="bold")
+                     ).grid(row=99, column=0, columnspan=2, sticky="ew", padx=8, pady=(6,0))
+        return f
+
+    def _upd_br(self):
+        try:
+            f=float(self.vars["f_clock_mhz"].get())
+            nb,nt1,nt2=int(self.vars["nom_brp"].get()),int(self.vars["nom_tseg1"].get()),int(self.vars["nom_tseg2"].get())
+            db,dt1,dt2=int(self.vars["data_brp"].get()),int(self.vars["data_tseg1"].get()),int(self.vars["data_tseg2"].get())
+            nom=(f*1e6)/(max(nb,1)*(1+nt1+nt2)); dat=(f*1e6)/(max(db,1)*(1+dt1+dt2))
+            self.bitrate_var.set(f"Nominal {nom/1e3:.0f} kbps  |  Data {dat/1e6:.2f} Mbps")
+        except: self.bitrate_var.set("")
+
+    def _browse(self):
+        p = Path(self.vars["bin_path"].get())
+        path = filedialog.askopenfilename(title="Select .bin",
+            initialdir=str(p.parent if p.parent.exists() else Path.cwd()),
+            filetypes=[("Firmware binary","*.bin"),("All","*.*")])
+        if path: self.vars["bin_path"].set(path)
+
+    def _refresh_info(self):
+        p = Path(self.vars["bin_path"].get())
+        if not p.exists(): self.file_info.set("File not found."); return
+        sz = p.stat().st_size
+        self.file_info.set(f"{p.name}  |  {sz:,} bytes  |  {sz/1024:.1f} KB")
+
+    def _save(self):
+        try: self._v2s().save(); self._log_line("[OK] Settings saved.\n", "ok")
+        except Exception as e: messagebox.showerror("Save failed", str(e))
+
+    def _reset(self):
+        if not messagebox.askyesno("Reset", "Reset all settings to defaults?"): return
+        d = FwSettings()
+        for f in fields(FwSettings): self.vars[f.name].set(getattr(d, f.name))
+        self._log_line("[OK] Reset to defaults.\n", "ok")
+
+    # ═══════════ Log queue ═════════════════════════════════════
+    def _log_line(self, text, tag=""):
+        self.log.configure(state="normal")
+        if text.endswith("\r"):
+            ls = self.log.index("end-1c linestart"); self.log.delete(ls, "end-1c")
+            self.log.insert(ls, text.rstrip("\r"), tag) if tag else self.log.insert(ls, text.rstrip("\r"))
+        else:
+            self.log.insert("end", text, tag) if tag else self.log.insert("end", text)
+        self.log.see("end"); self.log.configure(state="disabled")
+        self._upd_progress(text)
+
+    def _classify(self, l):
+        s = l.strip()
+        if "ABORTED" in s: return "warn"
+        if "FAIL" in s or "ERROR" in s: return "err"
+        if "OK" in s or "PASS" in s or "COMPLETE" in s: return "ok"
+        if s.startswith("["): return "info"
+        if "Retry" in s or "mismatch" in s: return "warn"
+        if s.startswith("  "): return "muted"
+        return ""
+
+    def _drain(self):
+        try:
+            while True:
+                c = self._q.get_nowait(); self._log_line(c, self._classify(c))
+        except queue.Empty: pass
+        self.after(60, self._drain)
+
+    def _clear_log(self):
+        self.log.configure(state="normal"); self.log.delete("1.0","end"); self.log.configure(state="disabled")
+
+    def _upd_progress(self, text):
+        m = self.BURST_RE.search(text)
+        if m:
+            pct, elapsed = int(m.group(3)), float(m.group(4))
+            self.pb.set(pct/100.0)
+            p = Path(self.vars["bin_path"].get())
+            tput = (p.stat().st_size * pct / 100.0 / max(elapsed,0.001) / 1024) if p.exists() else 0
+            eta = (elapsed/max(pct,1))*(100-pct)
+            self.detail_var.set(f"{pct}%  |  {tput:.1f} KB/s  |  ETA {eta:.1f}s")
+        line = text.strip()
+        if line.startswith("[START]"): self.state_var.set("Erasing Bank 2..."); self.pb.set(0)
+        elif line.startswith("[HEADER]"): self.state_var.set("Sending header...")
+        elif line.startswith("[DATA]"): self.state_var.set("Streaming firmware...")
+        elif line.startswith("[VERIFY]"): self.state_var.set("Verifying CRC32..."); self.pb.set(1.0)
+        elif "FIRMWARE TRANSFER COMPLETE" in line: self.state_var.set("Done - S-Board resetting."); self.detail_var.set("")
+        elif "FAILED" in line and "***" in line: self.state_var.set("Transfer failed."); self.detail_var.set("")
+        elif "SUCCESS" in line and "***" in line: self.state_var.set("Transfer complete.")
+        elif "ABORTED" in line: self.state_var.set("Transfer aborted."); self.detail_var.set("")
+
+    # ═══════════ Auto send / abort ═════════════════════════════
+    def _on_send(self):
+        if self._worker and self._worker.is_alive():
+            messagebox.showinfo("Busy", "Transfer running."); return
+        p = Path(self.vars["bin_path"].get())
+        if not p.exists(): messagebox.showerror("File not found", str(p)); return
+        try: s = self._v2s()
+        except Exception as e: messagebox.showerror("Invalid settings", str(e)); return
+        try: s.save()
+        except: pass
+        apply_settings(s)
+        self._clear_log(); self._abort.clear()
+        self.send_btn.configure(state="disabled", text="Sending...")
+        self.abort_btn.configure(state="normal")
+        self.pb.set(0); self.state_var.set("Connecting..."); self.detail_var.set("")
+        self._worker = threading.Thread(target=self._auto_worker, args=(s,), daemon=True)
+        self._worker.start()
+
+    def _on_abort(self):
+        if not self._worker or not self._worker.is_alive(): return
+        self._abort.set(); self.abort_btn.configure(state="disabled", text="Aborting...")
+        self.state_var.set("Aborting...")
+
+    def _finish(self):
+        self.send_btn.configure(state="normal", text="Send Firmware")
+        self.abort_btn.configure(state="disabled", text="Abort")
+
+    def _auto_worker(self, s):
+        old = sys.stdout; sys.stdout = _QueueWriter(self._q)
+        try:
+            try: sender = fw_sender.FirmwareSender(channel=s.pcan_channel)
+            except Exception as e:
+                print(f"\nERROR opening {s.pcan_channel}: {e}\n"); self.after(0, self._finish); return
+            sender.bus = _AbortableBus(sender.bus, self._abort)
+            try:
+                ok = sender.send_firmware(s.bin_path, version=int(s.version))
+                self._q.put("\n*** SUCCESS ***\n" if ok else "\n*** FAILED ***\n")
+            except _TransferAborted: self._q.put("\n*** ABORTED by user ***\n")
+            finally: sender.close()
+        finally: sys.stdout = old; self.after(0, self._finish)
+
+    # ═══════════ Manual control ════════════════════════════════
+    def _manual_connect(self):
+        if self._manual_bus:
+            self._log_line("[WARN] Already connected.\n", "warn"); return
+        s = self._v2s()
+        apply_settings(s)
+        try:
+            self._manual_bus = can.Bus(interface='pcan', channel=s.pcan_channel, fd=True,
+                                        **fw_sender.PCAN_FD_PARAMS)
+            self.conn_status.set("Connected")
+            self.conn_btn.configure(state="disabled"); self.disconn_btn.configure(state="normal")
+            self._log_line(f"[OK] Connected to {s.pcan_channel}.\n", "ok")
+        except Exception as e:
+            self._log_line(f"[ERROR] {e}\n", "err")
+
+    def _manual_disconnect(self):
+        if self._manual_bus:
+            self._manual_bus.shutdown(); self._manual_bus = None
+        self.conn_status.set("Disconnected")
+        self.conn_btn.configure(state="normal"); self.disconn_btn.configure(state="disabled")
+        self._log_line("[OK] Disconnected.\n", "ok")
+
+    def _require_bus(self):
+        if not self._manual_bus:
+            self._log_line("[ERROR] Not connected. Click 'Connect PCAN' first.\n", "err"); return False
+        return True
+
+    def _manual_send_cmd(self, cmd, payload=b''):
+        s = self._v2s()
+        frame = bytearray(64)
+        frame[0] = cmd; frame[1] = 0x01
+        frame[4:4+len(payload)] = payload[:60]
+        msg = can.Message(arbitration_id=s.cmd_can_id, data=bytes(frame),
+                          is_extended_id=False, is_fd=True, bitrate_switch=True)
+        self._manual_bus.send(msg)
+
+    def _manual_wait_resp(self, timeout=2.0):
+        s = self._v2s()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self._manual_bus.recv(timeout=max(deadline - time.monotonic(), 0.01))
+            if msg and msg.arbitration_id == s.resp_can_id:
+                return msg
+        return None
+
+    def _manual_start(self):
+        if not self._require_bus(): return
+        s = self._v2s()
+        self._log_line("\n[MANUAL] Step 1: Sending CMD_FW_START...\n", "info")
+        self._manual_send_cmd(s.cmd_fw_start)
+        self._log_line(f"  Waiting up to {s.erase_timeout}s for ACK...\n", "muted")
+        resp = self._manual_wait_resp(timeout=s.erase_timeout)
+        if resp and len(resp.data) >= 1 and resp.data[0] == s.resp_fw_ack:
+            self._log_line("  OK - Bank 2 erased, ready to receive.\n", "ok")
+        elif resp and len(resp.data) >= 1:
+            self._log_line(f"  Got response 0x{resp.data[0]:02X} (expected ACK 0x{s.resp_fw_ack:02X})\n", "err")
+        else:
+            self._log_line("  FAIL - No response.\n", "err")
+
+    def _manual_header(self):
+        if not self._require_bus(): return
+        s = self._v2s()
+        p = Path(s.bin_path)
+        if not p.exists(): self._log_line(f"[ERROR] File not found: {p}\n", "err"); return
+        raw = p.read_bytes()
+        padded = fw_sender.pad_to_64(raw)
+        crc = fw_sender.crc32_firmware(padded)
+        total = len(padded) // s.data_frame_size
+
+        self._manual_padded = padded
+        self._manual_total_frames = total
+        self._manual_frame_idx = 0
+        self.manual_data_status.set(f"Loaded: {len(raw):,}B raw, {len(padded):,}B padded, {total} frames, CRC 0x{crc:08X}")
+
+        self._log_line(f"\n[MANUAL] Step 2: Sending CMD_FW_HEADER...\n", "info")
+        self._log_line(f"  Size: {len(padded):,}B  Frames: {total}  CRC: 0x{crc:08X}  Ver: {s.version}\n", "muted")
+
+        payload = struct.pack('<HHIIIIII', s.header_magic, s.header_image_type,
+            len(padded), crc, s.version, s.header_dest_bank, s.header_entry_point, total)
+        self._manual_send_cmd(s.cmd_fw_header, payload)
+        resp = self._manual_wait_resp(timeout=s.ack_timeout)
+        if resp and len(resp.data) >= 1 and resp.data[0] == s.resp_fw_ack:
+            self._log_line("  OK - Header accepted.\n", "ok")
+        else:
+            self._log_line("  FAIL - No ACK.\n", "err")
+
+    def _manual_data(self):
+        if not self._require_bus(): return
+        if self._manual_padded is None:
+            self._log_line("[ERROR] No data loaded. Run Step 2 first.\n", "err"); return
+        s = self._v2s()
+        total = self._manual_total_frames
+        burst = s.burst_size
+        delay = s.inter_frame_delay_ms / 1000.0
+        self._log_line(f"\n[MANUAL] Step 3: Streaming {total} frames, burst={burst}...\n", "info")
+
+        # Run in thread so UI stays responsive
+        def worker():
+            idx = self._manual_frame_idx
+            t0 = time.monotonic()
+            while idx < total:
+                frames_in_burst = min(burst, total - idx)
+                for i in range(frames_in_burst):
+                    off = idx * s.data_frame_size
+                    data = self._manual_padded[off:off+s.data_frame_size]
+                    msg = can.Message(arbitration_id=s.data_can_id, data=data,
+                                      is_extended_id=False, is_fd=True, bitrate_switch=True)
+                    self._manual_bus.send(msg)
+                    idx += 1
+                    if i < frames_in_burst - 1: time.sleep(delay)
+                # Wait for ACK
+                resp = self._manual_wait_resp(timeout=s.ack_timeout)
+                if not resp or resp.data[0] != s.resp_fw_ack:
+                    self._q.put(f"  FAIL at frame {idx} - no ACK.\n"); break
+                pct = idx * 100 // total
+                elapsed = time.monotonic() - t0
+                self._q.put(f"  Burst {idx//burst}/{(total+burst-1)//burst} - {pct}% ({elapsed:.1f}s)\r")
+                if s.manual_burst_pause_ms > 0:
+                    time.sleep(s.manual_burst_pause_ms / 1000.0)
+            self._manual_frame_idx = idx
+            elapsed = time.monotonic() - t0
+            self._q.put(f"\n  Done: {idx}/{total} frames in {elapsed:.1f}s\n")
+            self.after(0, lambda: self.manual_data_status.set(
+                f"Sent {idx}/{total} frames."))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _manual_complete(self):
+        if not self._require_bus(): return
+        s = self._v2s()
+        self._log_line(f"\n[MANUAL] Step 4: Sending CMD_FW_COMPLETE...\n", "info")
+        self._manual_send_cmd(s.cmd_fw_complete)
+        self._log_line(f"  Waiting up to {s.verify_timeout}s...\n", "muted")
+        resp = self._manual_wait_resp(timeout=s.verify_timeout)
+        if resp and len(resp.data) >= 1:
+            code = resp.data[0]
+            if code == s.resp_fw_crc_pass:
+                self._log_line("  CRC PASSED - S-Board will write boot flag and reset.\n", "ok")
+            elif code == s.resp_fw_crc_fail:
+                self._log_line("  CRC FAILED - data corruption or wrong .bin file.\n", "err")
+            else:
+                self._log_line(f"  Unexpected response: 0x{code:02X}\n", "warn")
+        else:
+            self._log_line("  FAIL - No response.\n", "err")
+
+    def _manual_one_frame(self):
+        if not self._require_bus(): return
+        if self._manual_padded is None:
+            self._log_line("[ERROR] No data loaded. Run Step 2 first.\n", "err"); return
+        s = self._v2s()
+        idx = self._manual_frame_idx
+        if idx >= self._manual_total_frames:
+            self._log_line(f"[WARN] All {self._manual_total_frames} frames already sent.\n", "warn"); return
+        off = idx * s.data_frame_size
+        data = self._manual_padded[off:off+s.data_frame_size]
+        msg = can.Message(arbitration_id=s.data_can_id, data=data,
+                          is_extended_id=False, is_fd=True, bitrate_switch=True)
+        self._manual_bus.send(msg)
+        self._manual_frame_idx = idx + 1
+        hex_preview = ' '.join(f'{b:02X}' for b in data[:16])
+        self._log_line(f"  Frame {idx}: [{hex_preview} ...] ({self._manual_frame_idx}/{self._manual_total_frames})\n", "muted")
+        self.manual_data_status.set(f"Sent {self._manual_frame_idx}/{self._manual_total_frames} frames.")
+
+    # ═══════════ MCU Operations ═══════════════════════════════
+    def _mcu_send_cmd(self, cmd, payload=b''):
+        if not self._require_bus(): return None
+        s = self._v2s()
+        frame = bytearray(64)
+        frame[0] = cmd; frame[1] = 0x01
+        frame[4:4+len(payload)] = payload[:60]
+        msg = can.Message(arbitration_id=s.cmd_can_id, data=bytes(frame),
+                          is_extended_id=False, is_fd=True, bitrate_switch=True)
+        self._manual_bus.send(msg)
+        return self._manual_wait_resp(timeout=s.ack_timeout)
+
+    def _mcu_read_flag(self):
+        self._log_line("\n[MCU] Reading boot flag...\n", "info")
+        resp = self._mcu_send_cmd(0x34)  # CMD_READ_FLAG
+        if resp and len(resp.data) >= 20 and resp.data[0] == 0x29:
+            d = resp.data[4:]
+            pending = d[0] | (d[1] << 8)
+            crcflag = d[2] | (d[3] << 8)
+            imgsize = d[4] | (d[5] << 8) | (d[6] << 16) | (d[7] << 24)
+            imgcrc  = d[8] | (d[9] << 8) | (d[10] << 16) | (d[11] << 24)
+            self._log_line(f"  updatePending: 0x{pending:04X} {'(SET)' if pending == 0xA5A5 else '(not set)'}\n",
+                           "ok" if pending == 0xA5A5 else "muted")
+            self._log_line(f"  crcValid:      0x{crcflag:04X} {'(SET)' if crcflag == 0x5A5A else '(not set)'}\n",
+                           "ok" if crcflag == 0x5A5A else "muted")
+            self._log_line(f"  imageSize:     {imgsize} bytes (0x{imgsize:08X})\n", "muted")
+            self._log_line(f"  imageCRC:      0x{imgcrc:08X}\n", "muted")
+        elif resp:
+            self._log_line(f"  Unexpected response: 0x{resp.data[0]:02X}\n", "warn")
+        else:
+            self._log_line("  No response.\n", "err")
+
+    def _mcu_clear_flag(self):
+        if not messagebox.askyesno("Clear Flag", "Erase Bank 3 sector 0 (boot flag)?"): return
+        self._log_line("\n[MCU] Clearing boot flag...\n", "info")
+        resp = self._mcu_send_cmd(0x35)  # CMD_CLEAR_FLAG
+        if resp and resp.data[0] == 0x25:
+            self._log_line("  OK - Boot flag cleared.\n", "ok")
+        else:
+            self._log_line("  FAIL - No ACK.\n", "err")
+
+    def _mcu_write_flag(self):
+        s = self._v2s()
+        p = Path(s.bin_path)
+        if not p.exists():
+            self._log_line("[ERROR] .bin file not found for CRC calculation.\n", "err"); return
+        raw = p.read_bytes()
+        padded = fw_sender.pad_to_64(raw)
+        crc = fw_sender.crc32_firmware(padded)
+        size = len(padded)
+        if not messagebox.askyesno("Write Flag",
+            f"Write boot flag?\n\nSize: {size}\nCRC: 0x{crc:08X}\n\nThis will trigger update on next reset."): return
+        self._log_line(f"\n[MCU] Writing boot flag (size={size}, CRC=0x{crc:08X})...\n", "info")
+        payload = struct.pack('<II', size, crc)
+        resp = self._mcu_send_cmd(0x3A, payload)  # CMD_WRITE_FLAG
+        if resp and resp.data[0] == 0x25:
+            self._log_line("  OK - Boot flag written.\n", "ok")
+        else:
+            self._log_line("  FAIL - No ACK.\n", "err")
+
+    def _mcu_read_flash(self):
+        if not self._require_bus(): return
+        try: addr = int(self.mcu_addr_var.get(), 0)
+        except: self._log_line("[ERROR] Invalid address.\n", "err"); return
+        self._log_line(f"\n[MCU] Reading 8 words from 0x{addr:08X}...\n", "info")
+        payload = struct.pack('<I', addr)
+        resp = self._mcu_send_cmd(0x37, payload)  # CMD_READ_FLASH
+        if resp and len(resp.data) >= 20 and resp.data[0] == 0x2A:
+            d = resp.data[4:]
+            words = []
+            for i in range(8):
+                w = d[i*2] | (d[i*2+1] << 8)
+                words.append(w)
+            hex_str = ' '.join(f'{w:04X}' for w in words)
+            self._log_line(f"  [{hex_str}]\n", "muted")
+            all_ff = all(w == 0xFFFF for w in words)
+            if all_ff: self._log_line("  (all 0xFFFF = erased flash)\n", "warn")
+        elif resp:
+            self._log_line(f"  Unexpected: 0x{resp.data[0]:02X}\n", "warn")
+        else:
+            self._log_line("  No response.\n", "err")
+
+    def _mcu_erase_sector(self):
+        try: addr = int(self.mcu_addr_var.get(), 0)
+        except: self._log_line("[ERROR] Invalid address.\n", "err"); return
+        if not messagebox.askyesno("Erase", f"Erase sector at 0x{addr:08X}?"): return
+        self._log_line(f"\n[MCU] Erasing sector at 0x{addr:08X}...\n", "info")
+        payload = struct.pack('<I', addr)
+        resp = self._mcu_send_cmd(0x39, payload)  # CMD_ERASE_SECTOR
+        if resp and resp.data[0] == 0x25:
+            self._log_line("  OK - Sector erased.\n", "ok")
+        else:
+            self._log_line("  FAIL.\n", "err")
+
+    def _mcu_compute_crc(self):
+        if not self._require_bus(): return
+        try: addr = int(self.mcu_crc_addr.get(), 0)
+        except: self._log_line("[ERROR] Invalid address.\n", "err"); return
+        try: size = int(self.mcu_crc_size.get(), 0)
+        except: self._log_line("[ERROR] Invalid size.\n", "err"); return
+        self._log_line(f"\n[MCU] Computing CRC32 at 0x{addr:08X}, {size} bytes...\n", "info")
+        payload = struct.pack('<II', addr, size)
+        s = self._v2s()
+        resp = self._mcu_send_cmd(0x38, payload)  # CMD_COMPUTE_CRC
+        if resp and len(resp.data) >= 8 and resp.data[0] == 0x2B:
+            d = resp.data[4:]
+            crc = d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24)
+            self._log_line(f"  MCU CRC32: 0x{crc:08X}\n", "ok")
+            # Also compute locally if we have the bin
+            p = Path(s.bin_path)
+            if p.exists():
+                raw = p.read_bytes()
+                padded = fw_sender.pad_to_64(raw)
+                local_crc = fw_sender.crc32_firmware(padded)
+                match = "MATCH" if crc == local_crc else "MISMATCH"
+                tag = "ok" if crc == local_crc else "err"
+                self._log_line(f"  Local CRC: 0x{local_crc:08X} ({match})\n", tag)
+        elif resp:
+            self._log_line(f"  Unexpected: 0x{resp.data[0]:02X}\n", "warn")
+        else:
+            self._log_line("  No response.\n", "err")
+
+    def _mcu_get_state(self):
+        self._log_line("\n[MCU] Querying state...\n", "info")
+        resp = self._mcu_send_cmd(0x3B)  # CMD_GET_STATE
+        if resp and len(resp.data) >= 12 and resp.data[0] == 0x2C:
+            d = resp.data[4:]
+            states = {0:"IDLE", 1:"ERASING", 2:"WAITING_HEADER", 3:"RECEIVING", 4:"VERIFYING"}
+            st = d[0]; frames = d[1] | (d[2] << 8); burst = d[3]
+            waddr = d[4] | (d[5] << 8) | (d[6] << 16) | (d[7] << 24)
+            self._log_line(f"  State:     {states.get(st, f'UNKNOWN({st})')}\n", "ok")
+            self._log_line(f"  Frames:    {frames}\n", "muted")
+            self._log_line(f"  Burst cnt: {burst}\n", "muted")
+            self._log_line(f"  Write addr: 0x{waddr:08X}\n", "muted")
+        elif resp:
+            self._log_line(f"  Unexpected: 0x{resp.data[0]:02X}\n", "warn")
+        else:
+            self._log_line("  No response.\n", "err")
+
+    def _mcu_reset(self):
+        if not messagebox.askyesno("Reset", "Reset the S-Board MCU?"): return
+        self._log_line("\n[MCU] Resetting device...\n", "info")
+        resp = self._mcu_send_cmd(0x36)  # CMD_RESET_DEVICE
+        if resp and resp.data[0] == 0x25:
+            self._log_line("  OK - Device resetting.\n", "ok")
+        else:
+            self._log_line("  Sent (no ACK expected after reset).\n", "warn")
+
+    def _mcu_send_raw(self):
+        if not self._require_bus(): return
+        try: cid = int(self.raw_id_var.get(), 0)
+        except: self._log_line("[ERROR] Invalid CAN ID.\n", "err"); return
+        try:
+            hex_str = self.raw_data_var.get().replace(',', ' ').strip()
+            data_bytes = bytes.fromhex(hex_str.replace(' ', ''))
+        except: self._log_line("[ERROR] Invalid hex data.\n", "err"); return
+        frame = bytearray(64)
+        frame[:len(data_bytes)] = data_bytes[:64]
+        msg = can.Message(arbitration_id=cid, data=bytes(frame),
+                          is_extended_id=False, is_fd=True, bitrate_switch=True)
+        self._manual_bus.send(msg)
+        preview = ' '.join(f'{b:02X}' for b in data_bytes[:16])
+        self._log_line(f"[TX] ID={cid} [{preview}...]\n", "ok")
+
+    # ═══════════ CAN Monitor ═══════════════════════════════════
+    def _monitor_toggle(self):
+        if self._monitoring:
+            self._monitoring = False
+            self.monitor_btn.configure(text="Start Monitor")
+            self.monitor_status.set("Stopped")
+        else:
+            if not self._manual_bus:
+                self._log_line("[ERROR] Connect PCAN first.\n", "err"); return
+            self._monitoring = True
+            self.monitor_btn.configure(text="Stop Monitor")
+            self.monitor_status.set("Running...")
+            self._monitor_thread = threading.Thread(target=self._monitor_worker, daemon=True)
+            self._monitor_thread.start()
+
+    def _monitor_worker(self):
+        while self._monitoring and self._manual_bus:
+            try:
+                msg = self._manual_bus.recv(timeout=0.1)
+            except: break
+            if msg is None: continue
+            ts = time.strftime("%H:%M:%S")
+            d = ' '.join(f'{b:02X}' for b in msg.data[:min(len(msg.data), 16)])
+            direction = "RX"
+            line = f"[{ts}] ID=0x{msg.arbitration_id:03X} DLC={msg.dlc:2d} [{d}]\n"
+            self.after(0, lambda l=line: self._monitor_append(l))
+
+    def _monitor_append(self, line):
+        self.monitor_text.configure(state="normal")
+        tag = "rx" if "RX" in line[:10] else ""
+        self.monitor_text.insert("end", line, tag)
+        self.monitor_text.see("end")
+        self.monitor_text.configure(state="disabled")
+
+    def _monitor_clear(self):
+        self.monitor_text.configure(state="normal")
+        self.monitor_text.delete("1.0", "end")
+        self.monitor_text.configure(state="disabled")
+
+    # ═══════════ Quit ══════════════════════════════════════════
+    def _on_quit(self):
+        if self._worker and self._worker.is_alive():
+            if not messagebox.askyesno("Busy", "Transfer running. Quit anyway?"): return
+        if self._manual_bus:
+            self._manual_bus.shutdown()
+        try: self._v2s().save()
+        except: pass
+        self.destroy()
+
+def main():
+    App().mainloop()
+
+if __name__ == "__main__":
+    main()
