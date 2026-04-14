@@ -126,6 +126,21 @@ class FwSettings:
     bu_target_id: int = 11                   # last-used target BU (11..22 or 0xFF)
     bu_auto_poll_ms: int = 1000              # auto-poll period (ms)
 
+    # ── BU Direct mode (PCAN -> BU board, BYPASSES the S-Board) ─────
+    # Lets you flash a BU board with the GUI acting as the master,
+    # over the same CAN IDs the S-Board's fw_bu_master would use.
+    # Useful for bring-up before the S-Board sender path is verified.
+    bu_dir_data_can_id: int = 0x30           # PCAN -> BU: data frames
+    bu_dir_cmd_can_id: int = 0x31            # PCAN -> BU: commands
+    bu_dir_resp_can_id: int = 0x32           # BU -> PCAN: responses
+    bu_dir_target_id: int = 11               # which BU to flash (must match FW_BU_BOARD_ID_OVERRIDE on the BU side)
+    bu_dir_burst_size: int = 16              # data frames per ACK window
+    bu_dir_payload_bytes: int = 64           # firmware bytes per data frame (RAW, no header)
+    bu_dir_prepare_timeout: float = 8.0      # erase Bank 2 can take a few seconds
+    bu_dir_ack_timeout: float = 0.5
+    bu_dir_verify_timeout: float = 8.0
+    bu_dir_inter_frame_ms: float = 1.0       # pause between frames in a burst
+
     def save(self, p=SETTINGS_PATH):
         p.write_text(json.dumps(asdict(self), indent=2))
     @classmethod
@@ -321,11 +336,12 @@ class App(ctk.CTk):
     def _build_tabs(self, parent):
         tabs = ctk.CTkTabview(parent, corner_radius=10)
         tabs.grid(row=0, column=0, sticky="nsew", padx=(0,8))
-        for n in ("Manual Control", "MCU Operations", "BU OTA", "CAN Monitor", "CAN Bus", "Protocol", "Timing", "Header", "Settings"):
+        for n in ("Manual Control", "MCU Operations", "BU OTA", "BU Direct", "CAN Monitor", "CAN Bus", "Protocol", "Timing", "Header", "Settings"):
             tabs.add(n)
         self._build_manual_tab(tabs.tab("Manual Control"))
         self._build_mcu_tab(tabs.tab("MCU Operations"))
         self._build_bu_ota_tab(tabs.tab("BU OTA"))
+        self._build_bu_direct_tab(tabs.tab("BU Direct"))
         self._build_monitor_tab(tabs.tab("CAN Monitor"))
         self._build_can_tab(tabs.tab("CAN Bus"))
         self._build_protocol_tab(tabs.tab("Protocol"))
@@ -895,6 +911,524 @@ class App(ctk.CTk):
             self._log_line("[BU OTA] Sent ABORT (0x55) on ID 0x31.\n", "ok")
         except Exception as e:
             self._log_line(f"[BU OTA] ABORT send failed: {e}\n", "err")
+
+    # ═══════════ BU Direct tab ═══════════════════════════════════
+    # GUI talks DIRECTLY to a BU board over CAN-FD via PCAN, bypassing
+    # the S-Board entirely. Mirrors the existing Manual Control tab
+    # but speaks the BU receiver's protocol (cmds 0x50..0x55, responses
+    # 0x60..0x64) on CAN IDs 0x30 (data) / 0x31 (cmd) / 0x32 (resp).
+    #
+    # Use this for BU-side bring-up before the S-Board sender path
+    # is verified. Same .bin file you'd stage into S-Board Bank 1
+    # works here — pick it via the main card's Browse... button.
+    _BU_DIR_STATES = {
+        0: "IDLE",
+        1: "PREPARING",
+        2: "WAITING_HEADER",
+        3: "RECEIVING",
+        4: "VERIFYING",
+        5: "ACTIVATING",
+    }
+
+    def _build_bu_direct_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True)
+        s.grid_columnconfigure(0, weight=1)
+
+        self._sec(s, "WHAT THIS DOES").grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        intro = ctk.CTkLabel(
+            s,
+            text=(
+                "Flashes a BU board DIRECTLY from this GUI via PCAN.\n"
+                "Bypasses the S-Board completely — useful for bringing\n"
+                "up the BU-side receiver before the S-Board sender path\n"
+                "is verified. Requires the BU firmware (built with\n"
+                "BU_FW_FLASH_STUB=0 and FW_BU_BOARD_ID_OVERRIDE matching\n"
+                "the target id below) to be flashed on the BU board.\n\n"
+                "Steps:\n"
+                "  1. Connect PCAN (Manual Control tab)\n"
+                "  2. Pick the BU .bin (main card Browse...)\n"
+                "  3. Click Prepare BU → Header → Stream Data → Verify\n"
+                "  4. Click Activate to write the boot flag and reset"
+            ),
+            justify="left",
+            text_color=("#888", "#aaa"),
+            font=ctk.CTkFont(size=11),
+        )
+        intro.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        # ── Connection / target ──────────────────────────────────
+        self._sec(s, "TARGET").grid(row=2, column=0, sticky="ew", pady=(8, 6))
+        tf = ctk.CTkFrame(s, corner_radius=8)
+        tf.grid(row=3, column=0, sticky="ew", padx=4, pady=4)
+        tf.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(tf, text="BU board id:", font=ctk.CTkFont(size=12)).grid(
+            row=0, column=0, padx=(10, 4), pady=10, sticky="w"
+        )
+        ctk.CTkEntry(
+            tf, textvariable=self.vars["bu_dir_target_id"],
+            width=90, height=32,
+        ).grid(row=0, column=1, padx=4, pady=10, sticky="w")
+        ctk.CTkLabel(
+            tf,
+            text="(must match FW_BU_BOARD_ID_OVERRIDE on the BU)",
+            text_color=("#888", "#777"),
+            font=ctk.CTkFont(size=10),
+        ).grid(row=0, column=2, padx=(4, 10), pady=10, sticky="w")
+
+        # ── Step buttons ─────────────────────────────────────────
+        self._sec(s, "STEP-BY-STEP").grid(row=4, column=0, sticky="ew", pady=(14, 6))
+        info = ctk.CTkLabel(
+            s,
+            text=("Each step is ONE click. The BU receiver responds on\n"
+                  "CAN ID 0x32 — replies are parsed and shown below."),
+            justify="left", text_color=("#888","#aaa"),
+            font=ctk.CTkFont(size=11),
+        )
+        info.grid(row=5, column=0, sticky="ew", padx=8, pady=(0,4))
+
+        steps = [
+            ("1. Prepare BU (erase Bank 2)",
+             "Send CMD_FW_PREPARE (0x50). BU erases all 128 sectors of\n"
+             "its Bank 2 staging area. Long timeout.",
+             self._bu_dir_prepare),
+            ("2. Send Header",
+             "Send CMD_FW_HEADER (0x51) with image size, CRC32, version.\n"
+             "BU parses and ACKs.",
+             self._bu_dir_header),
+            ("3. Stream Data",
+             "Send firmware data frames (60 bytes each) on ID 0x30 in\n"
+             "bursts. BU ACKs after every burst window.",
+             self._bu_dir_data),
+            ("4. Verify CRC",
+             "Send CMD_FW_VERIFY (0x53). BU computes CRC32 over Bank 2\n"
+             "and replies VERIFY_PASS or VERIFY_FAIL.",
+             self._bu_dir_verify),
+            ("5. Activate (reset)",
+             "Send CMD_FW_ACTIVATE (0x54). BU writes boot flag to Bank 3\n"
+             "and resets — boot manager copies Bank 2 → Bank 0.\n"
+             "NO reply expected (device is rebooting).",
+             self._bu_dir_activate),
+            ("6. Send Single Frame",
+             "Send exactly ONE data frame (next in sequence). For\n"
+             "byte-level debugging.",
+             self._bu_dir_one_frame),
+        ]
+        for i, (title, desc, cmd) in enumerate(steps):
+            row = 6 + i
+            bf = ctk.CTkFrame(s, corner_radius=8)
+            bf.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
+            bf.grid_columnconfigure(1, weight=1)
+            ctk.CTkButton(
+                bf, text=title, width=240, height=36, command=cmd,
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+            ctk.CTkLabel(
+                bf, text=desc, justify="left",
+                text_color=("#666","#aaa"),
+                font=ctk.CTkFont(size=11), wraplength=380,
+            ).grid(row=0, column=1, padx=(0,10), pady=10, sticky="w")
+
+        # ── Abort / utility row ──────────────────────────────────
+        af = ctk.CTkFrame(s, fg_color="transparent")
+        af.grid(row=12, column=0, sticky="ew", padx=4, pady=(8,4))
+        ctk.CTkButton(
+            af, text="ABORT (0x55)", width=140, height=34,
+            fg_color=("#a44","#a44"), hover_color=("#c55","#c55"),
+            command=self._bu_dir_abort,
+        ).pack(side="left", padx=(0,8))
+
+        # ── Status display ───────────────────────────────────────
+        self._sec(s, "STATUS").grid(row=13, column=0, sticky="ew", pady=(14, 6))
+        self.bu_dir_status_image = tk.StringVar(value="No image loaded.")
+        self.bu_dir_status_last  = tk.StringVar(value="(no reply yet)")
+        self.bu_dir_status_state = tk.StringVar(value="—")
+        self.bu_dir_status_progress = tk.StringVar(value="—")
+        sf = ctk.CTkFrame(s, corner_radius=8)
+        sf.grid(row=14, column=0, sticky="ew", padx=4, pady=4)
+        sf.grid_columnconfigure(1, weight=1)
+        rows = [
+            ("Image:", self.bu_dir_status_image),
+            ("Last reply:", self.bu_dir_status_last),
+            ("BU state:", self.bu_dir_status_state),
+            ("Progress:", self.bu_dir_status_progress),
+        ]
+        for i, (label, var) in enumerate(rows):
+            ctk.CTkLabel(
+                sf, text=label, anchor="e",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=i, column=0, padx=(10, 6), pady=4, sticky="e")
+            ctk.CTkLabel(
+                sf, textvariable=var, anchor="w",
+                font=ctk.CTkFont(size=12, family="Consolas"),
+            ).grid(row=i, column=1, padx=(0, 10), pady=4, sticky="ew")
+
+        # ── Configurable IDs / timing ────────────────────────────
+        self._sec(s, "CONFIGURATION (hex OK)").grid(row=15, column=0, sticky="ew", pady=(14, 6))
+        cf = ctk.CTkFrame(s, corner_radius=8)
+        cf.grid(row=16, column=0, sticky="ew", padx=4, pady=4)
+        cf.grid_columnconfigure((0,1,2), weight=1)
+        LE(cf, "Data CAN ID (PC→BU)", self.vars["bu_dir_data_can_id"]).grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        LE(cf, "Cmd CAN ID (PC→BU)", self.vars["bu_dir_cmd_can_id"]).grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        LE(cf, "Resp CAN ID (BU→PC)", self.vars["bu_dir_resp_can_id"]).grid(row=0, column=2, padx=4, pady=4, sticky="ew")
+        LE(cf, "Burst size", self.vars["bu_dir_burst_size"], unit="frames").grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        LE(cf, "Payload bytes/frame", self.vars["bu_dir_payload_bytes"], unit="bytes").grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        LE(cf, "Inter-frame delay", self.vars["bu_dir_inter_frame_ms"], unit="ms").grid(row=1, column=2, padx=4, pady=4, sticky="ew")
+        LE(cf, "Prepare timeout", self.vars["bu_dir_prepare_timeout"], unit="s").grid(row=2, column=0, padx=4, pady=4, sticky="ew")
+        LE(cf, "Burst ACK timeout", self.vars["bu_dir_ack_timeout"], unit="s").grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+        LE(cf, "Verify timeout", self.vars["bu_dir_verify_timeout"], unit="s").grid(row=2, column=2, padx=4, pady=4, sticky="ew")
+
+        # Streaming state — survives across step-button clicks
+        self._bu_dir_padded       = None
+        self._bu_dir_total_frames = 0
+        self._bu_dir_frame_idx    = 0
+        self._bu_dir_image_size   = 0
+        self._bu_dir_image_crc    = 0
+
+    # ═══════════ BU Direct handlers ═══════════════════════════════
+    def _bu_dir_send_cmd(self, opcode: int, payload: bytes = b"") -> bool:
+        """Send a 64-byte command frame on the BU command CAN ID.
+        Frame layout matches what fw_update_bu.c parses:
+            data[0] = opcode (BU_CMD_FW_*)
+            data[1] = target BU id (filtered by buFw_isAddressedToMe)
+            data[2..3] = 0 (seq, unused for command frames)
+            data[4..63] = command-specific payload
+        """
+        if not self._require_bus():
+            return False
+        try:
+            target = int(self.vars["bu_dir_target_id"].get())
+            cmd_id = int(self.vars["bu_dir_cmd_can_id"].get())
+        except Exception:
+            self._log_line("[BU DIR] Invalid target or CAN id.\n", "err")
+            return False
+        frame = bytearray(64)
+        frame[0] = opcode & 0xFF
+        frame[1] = target & 0xFF
+        frame[2] = 0
+        frame[3] = 0
+        if payload:
+            for i, b in enumerate(payload[:60]):
+                frame[4 + i] = b
+        try:
+            self._manual_bus.send(can.Message(
+                arbitration_id=cmd_id,
+                data=bytes(frame),
+                is_extended_id=False,
+                is_fd=True,
+                bitrate_switch=True,
+            ))
+            return True
+        except Exception as e:
+            self._log_line(f"[BU DIR] cmd send failed: {e}\n", "err")
+            return False
+
+    def _bu_dir_send_data_frame(self, seq: int, payload64: bytes) -> bool:
+        """Send a single 64-byte raw data frame on the BU data CAN ID.
+
+        Format matches fw_update_bu.c's new data path AND the existing
+        S-Board self-update path: the entire CAN-FD payload is RAW
+        firmware bytes (no command byte, no target id, no per-frame
+        sequence). The receiver writes data[0..63] straight to flash.
+        Target selection happens once via the PREPARE command (sent
+        on the COMMAND CAN ID with target id in data[1]); after that
+        only the BU in RECEIVING state consumes data frames.
+
+        `seq` is kept in the API only for logging — the wire frame
+        does not carry it.
+        """
+        try:
+            data_id = int(self.vars["bu_dir_data_can_id"].get())
+        except Exception:
+            return False
+        frame = bytearray(64)
+        n = min(64, len(payload64))
+        frame[0:n] = payload64[:n]
+        # If the payload is short (last partial chunk), the rest stays
+        # 0x00. The receiver always writes the full 64-byte frame to
+        # flash; only the first imageSize bytes are CRC'd, so the
+        # trailing zeros are harmless. (For best-match-with-host CRC
+        # the caller should pad with 0xFF instead of relying on the
+        # 0-fill — see _bu_dir_data().)
+        try:
+            self._manual_bus.send(can.Message(
+                arbitration_id=data_id,
+                data=bytes(frame),
+                is_extended_id=False,
+                is_fd=True,
+                bitrate_switch=True,
+            ))
+            return True
+        except Exception as e:
+            self._log_line(f"[BU DIR] data send failed at seq {seq}: {e}\n", "err")
+            return False
+
+    def _bu_dir_wait_resp(self, timeout: float, expected: tuple = ()):
+        """Read frames until one matches the BU response CAN ID, then
+        parse the buFw_sendResponse byte layout into a dict. If
+        `expected` is non-empty, only return when the response code
+        is in that set (skipping unrelated frames). Returns the
+        parsed reply or None on timeout."""
+        try:
+            resp_id = int(self.vars["bu_dir_resp_can_id"].get())
+        except Exception:
+            resp_id = 0x32
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self._manual_bus.recv(timeout=max(deadline - time.monotonic(), 0.01))
+            if msg is None or msg.arbitration_id != resp_id:
+                continue
+            if len(msg.data) < 8:
+                continue
+            d = msg.data
+            reply = {
+                "code":         d[0],
+                "src_id":       d[1],
+                "seq":          d[2] | (d[3] << 8),
+                "state":        d[4],
+                "frames_recv":  d[5] | (d[6] << 8) | (d[7] << 16),
+            }
+            if expected and reply["code"] not in expected:
+                continue
+            return reply
+        return None
+
+    def _bu_dir_show_reply(self, reply):
+        if reply is None:
+            self.bu_dir_status_last.set("(no reply / timeout)")
+            return
+        names = {
+            0x60: "ACK",
+            0x61: "NAK",
+            0x62: "VERIFY_PASS",
+            0x63: "VERIFY_FAIL",
+            0x64: "BOOT_OK",
+        }
+        name = names.get(reply["code"], f"0x{reply['code']:02X}")
+        self.bu_dir_status_last.set(
+            f"{name}  src=BU#{reply['src_id']}  seq={reply['seq']}"
+        )
+        st = self._BU_DIR_STATES.get(reply["state"], f"UNKNOWN({reply['state']})")
+        self.bu_dir_status_state.set(f"{st} (0x{reply['state']:02X})")
+
+    def _bu_dir_load_image(self):
+        """Read the .bin file from the main card's bin_path, pad to
+        a 64-byte boundary, compute CRC32. Stash padded image and
+        metadata in instance vars for streaming."""
+        s = self._v2s()
+        p = Path(s.bin_path)
+        if not p.exists():
+            self._log_line(f"[BU DIR] file not found: {p}\n", "err")
+            return False
+        raw = p.read_bytes()
+        padded = fw_sender.pad_to_64(raw)
+        crc    = fw_sender.crc32_firmware(padded)
+        try:
+            payload_bytes = max(1, int(self.vars["bu_dir_payload_bytes"].get()))
+        except Exception:
+            payload_bytes = 60
+        self._bu_dir_padded       = padded
+        self._bu_dir_image_size   = len(padded)
+        self._bu_dir_image_crc    = crc
+        self._bu_dir_total_frames = (len(padded) + payload_bytes - 1) // payload_bytes
+        self._bu_dir_frame_idx    = 0
+        self.bu_dir_status_image.set(
+            f"{p.name}  |  raw {len(raw):,}B  |  padded {len(padded):,}B  |  "
+            f"frames {self._bu_dir_total_frames}  |  CRC32 0x{crc:08X}"
+        )
+        return True
+
+    def _bu_dir_prepare(self):
+        if not self._bu_dir_load_image():
+            return
+        s = self._v2s()
+        self._log_line("\n[BU DIR] Step 1: PREPARE (0x50) — erase Bank 2...\n", "info")
+        if not self._bu_dir_send_cmd(0x50):
+            return
+        self._log_line(
+            f"  Waiting up to {s.bu_dir_prepare_timeout:.0f}s for ACK...\n", "muted"
+        )
+        reply = self._bu_dir_wait_resp(
+            s.bu_dir_prepare_timeout, expected=(0x60, 0x61)
+        )
+        self._bu_dir_show_reply(reply)
+        if reply and reply["code"] == 0x60:
+            self._log_line("  OK — Bank 2 erased, ready for header.\n", "ok")
+        elif reply:
+            self._log_line(f"  FAIL — got 0x{reply['code']:02X}\n", "err")
+        else:
+            self._log_line("  FAIL — no reply from BU. Is the target id correct?\n", "err")
+
+    def _bu_dir_header(self):
+        if self._bu_dir_padded is None:
+            self._log_line("[BU DIR] No image loaded — click Prepare first.\n", "err")
+            return
+        s = self._v2s()
+        # Header payload layout (matches fw_update_bu.c handleHeader,
+        # which reads: data[4..7] imageSize, data[8..11] imageCRC,
+        # data[12..15] version):
+        payload = bytearray(20)
+        size = self._bu_dir_image_size
+        crc  = self._bu_dir_image_crc
+        ver  = int(s.version)
+        payload[0:4] = size.to_bytes(4, "little")
+        payload[4:8] = crc.to_bytes(4, "little")
+        payload[8:12] = ver.to_bytes(4, "little")
+        self._log_line(
+            f"\n[BU DIR] Step 2: HEADER (0x51) — size={size} CRC=0x{crc:08X} ver={ver}\n",
+            "info",
+        )
+        if not self._bu_dir_send_cmd(0x51, bytes(payload)):
+            return
+        reply = self._bu_dir_wait_resp(s.bu_dir_ack_timeout * 4, expected=(0x60, 0x61))
+        self._bu_dir_show_reply(reply)
+        if reply and reply["code"] == 0x60:
+            self._log_line("  OK — header accepted.\n", "ok")
+            self._bu_dir_frame_idx = 0
+        else:
+            self._log_line("  FAIL — header rejected.\n", "err")
+
+    def _bu_dir_data(self):
+        if self._bu_dir_padded is None:
+            self._log_line("[BU DIR] No image loaded.\n", "err")
+            return
+        if not self._require_bus():
+            return
+        s = self._v2s()
+        try:
+            payload_bytes = max(1, int(self.vars["bu_dir_payload_bytes"].get()))
+            burst_size    = max(1, int(self.vars["bu_dir_burst_size"].get()))
+        except Exception:
+            payload_bytes, burst_size = 60, 16
+        total = self._bu_dir_total_frames
+        delay = s.bu_dir_inter_frame_ms / 1000.0
+        self._log_line(
+            f"\n[BU DIR] Step 3: STREAM DATA — {total} frames, burst={burst_size}, "
+            f"{payload_bytes}B/frame...\n",
+            "info",
+        )
+
+        def worker():
+            idx = self._bu_dir_frame_idx
+            t0 = time.monotonic()
+            while idx < total:
+                frames_in_burst = min(burst_size, total - idx)
+                # Send the burst
+                for _ in range(frames_in_burst):
+                    off = idx * payload_bytes
+                    chunk = self._bu_dir_padded[off:off + payload_bytes]
+                    if len(chunk) < payload_bytes:
+                        chunk = chunk + bytes([0xFF] * (payload_bytes - len(chunk)))
+                    if not self._bu_dir_send_data_frame(idx, chunk):
+                        self._q.put(f"  FAIL — send error at seq {idx}\n")
+                        return
+                    idx += 1
+                    if delay > 0:
+                        time.sleep(delay)
+                # Wait for the burst ACK from the BU
+                reply = self._bu_dir_wait_resp(
+                    s.bu_dir_ack_timeout, expected=(0x60, 0x61)
+                )
+                if reply is None:
+                    self._q.put(f"  FAIL — no ACK after burst ending at seq {idx-1}\n")
+                    return
+                if reply["code"] != 0x60:
+                    self._q.put(
+                        f"  FAIL — got 0x{reply['code']:02X} after burst ending at seq {idx-1}\n"
+                    )
+                    return
+                pct = idx * 100 // total
+                elapsed = time.monotonic() - t0
+                self._q.put(
+                    f"  Burst ending at seq {idx-1} — {pct}% ({elapsed:.1f}s)  "
+                    f"frames_recv={reply['frames_recv']}\r"
+                )
+                self.after(0, lambda r=reply: self._bu_dir_show_reply(r))
+                self.after(0, lambda i=idx, t=total:
+                           self.bu_dir_status_progress.set(f"{i}/{t} frames"))
+            self._bu_dir_frame_idx = idx
+            elapsed = time.monotonic() - t0
+            self._q.put(f"\n  Done — {idx}/{total} frames in {elapsed:.1f}s\n")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _bu_dir_verify(self):
+        s = self._v2s()
+        self._log_line("\n[BU DIR] Step 4: VERIFY (0x53) — BU computes CRC32...\n", "info")
+        if not self._bu_dir_send_cmd(0x53):
+            return
+        reply = self._bu_dir_wait_resp(
+            s.bu_dir_verify_timeout, expected=(0x62, 0x63)
+        )
+        self._bu_dir_show_reply(reply)
+        if reply is None:
+            self._log_line("  FAIL — no reply.\n", "err")
+        elif reply["code"] == 0x62:
+            self._log_line("  CRC PASSED — image OK in Bank 2.\n", "ok")
+        elif reply["code"] == 0x63:
+            self._log_line("  CRC FAILED — image is corrupted.\n", "err")
+
+    def _bu_dir_activate(self):
+        if not messagebox.askyesno(
+            "Activate BU",
+            "Send CMD_FW_ACTIVATE (0x54)?\n\n"
+            "The BU board will write its boot flag to Bank 3 sector 0\n"
+            "and reset itself. The boot manager will then copy Bank 2\n"
+            "→ Bank 0 sectors 8..127 and reboot into the new app.\n\n"
+            "There will be NO reply on CAN — the device is rebooting.",
+        ):
+            return
+        self._log_line("\n[BU DIR] Step 5: ACTIVATE (0x54) — write boot flag, reset...\n", "info")
+        if not self._bu_dir_send_cmd(0x54):
+            return
+        self._log_line(
+            "  Sent. Watch the BU heartbeat LED — it should blink off,\n"
+            "  then come back as the boot manager runs and the new app boots.\n",
+            "muted",
+        )
+
+    def _bu_dir_abort(self):
+        self._log_line("\n[BU DIR] ABORT (0x55)\n", "info")
+        if not self._bu_dir_send_cmd(0x55):
+            return
+        s = self._v2s()
+        reply = self._bu_dir_wait_resp(s.bu_dir_ack_timeout, expected=(0x60,))
+        self._bu_dir_show_reply(reply)
+        if reply:
+            self._log_line("  OK — BU returned to IDLE.\n", "ok")
+            self._bu_dir_frame_idx = 0
+
+    def _bu_dir_one_frame(self):
+        if self._bu_dir_padded is None:
+            self._log_line("[BU DIR] No image loaded — click Prepare first.\n", "err")
+            return
+        try:
+            payload_bytes = max(1, int(self.vars["bu_dir_payload_bytes"].get()))
+        except Exception:
+            payload_bytes = 60
+        idx = self._bu_dir_frame_idx
+        if idx >= self._bu_dir_total_frames:
+            self._log_line(
+                f"[BU DIR] All {self._bu_dir_total_frames} frames already sent.\n",
+                "warn",
+            )
+            return
+        off = idx * payload_bytes
+        chunk = self._bu_dir_padded[off:off + payload_bytes]
+        if len(chunk) < payload_bytes:
+            chunk = chunk + bytes([0xFF] * (payload_bytes - len(chunk)))
+        if not self._bu_dir_send_data_frame(idx, chunk):
+            return
+        self._bu_dir_frame_idx = idx + 1
+        preview = " ".join(f"{b:02X}" for b in chunk[:16])
+        self._log_line(
+            f"  Frame {idx}: [{preview} ...] "
+            f"({self._bu_dir_frame_idx}/{self._bu_dir_total_frames})\n",
+            "muted",
+        )
+        self.bu_dir_status_progress.set(
+            f"{self._bu_dir_frame_idx}/{self._bu_dir_total_frames} frames"
+        )
 
     def _build_can_tab(self, tab):
         s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
