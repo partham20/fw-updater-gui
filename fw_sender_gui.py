@@ -86,6 +86,35 @@ class FwSettings:
     manual_single_frame: bool = False  # send one frame at a time
     manual_burst_pause_ms: int = 0     # pause between bursts (0=no pause)
 
+    # ── Target mode ────────────────────────────────────────────────
+    # "S-Board"     → stages the S-Board's own .bin into Bank 2 (self-update)
+    # "BU via Bank1" → stages a BU board's .bin into S-Board Bank 1, to be
+    #                  streamed to a BU board later by fw_bu_master on the
+    #                  S-Board side. Uses a disjoint CAN ID / command set so
+    #                  both receivers can coexist on the bus.
+    target_mode: str = "S-Board"
+
+    # S-Board preset (snapshot — live fields are restored from this when
+    # switching back from BU mode)
+    s_cmd_can_id: int = 7;  s_data_can_id: int = 6;  s_resp_can_id: int = 8
+    s_cmd_fw_start: int = 0x30
+    s_cmd_fw_header: int = 0x31
+    s_cmd_fw_complete: int = 0x33
+    s_resp_fw_ack: int = 0x25;      s_resp_fw_nak: int = 0x26
+    s_resp_fw_crc_pass: int = 0x27; s_resp_fw_crc_fail: int = 0x28
+    s_header_dest_bank: int = 0x0C0000
+    s_header_image_type: int = 0x0001
+
+    # BU preset (matches fw_bu_image_rx.h on the S-Board firmware)
+    bu_cmd_can_id: int = 0x19; bu_data_can_id: int = 0x18; bu_resp_can_id: int = 0x1A
+    bu_cmd_fw_start: int = 0x40
+    bu_cmd_fw_header: int = 0x41
+    bu_cmd_fw_complete: int = 0x42
+    bu_resp_fw_ack: int = 0x45;      bu_resp_fw_nak: int = 0x46
+    bu_resp_fw_crc_pass: int = 0x47; bu_resp_fw_crc_fail: int = 0x48
+    bu_header_dest_bank: int = 0x0A0000
+    bu_header_image_type: int = 0x0002
+
     def save(self, p=SETTINGS_PATH):
         p.write_text(json.dumps(asdict(self), indent=2))
     @classmethod
@@ -168,6 +197,32 @@ class App(ctk.CTk):
                 elif f.type in ("bool", bool): kw[f.name] = bool(v)
                 else: kw[f.name] = v
             except: kw[f.name] = getattr(self.settings, f.name)
+
+        # ── Force live mode-specific fields to the ACTIVE preset.
+        # target_mode is the single source of truth for which set of
+        # CAN IDs / command codes / dest bank get pushed down to
+        # fw_sender (and the manual / MCU-op handlers). The "live"
+        # cmd_can_id / cmd_fw_start / etc. fields are bound to the
+        # Protocol/Header tabs and CAN drift away from the active
+        # mode in several ways:
+        #   - settings.json from a pre-target_mode build of the GUI
+        #     leaves only the old live values populated, and they may
+        #     have been BU values when last saved
+        #   - a prior session was in BU mode, quit-saved live BU values,
+        #     and on next launch target_mode reverts to default "S-Board"
+        #   - Tk var init order races with the startup preset reload
+        #
+        # Whatever the cause, we re-derive live = preset[target_mode]
+        # right here so the send path can never send the wrong-mode
+        # commands. (User edits made directly in the Protocol/Header
+        # tabs while a mode is active should also be mirrored into
+        # the matching s_*/bu_* preset — see _on_target_change.)
+        target_mode = kw.get("target_mode", "S-Board")
+        slot_idx = 2 if target_mode == "BU via Bank1" else 1
+        for entry in self._TARGET_FIELD_MAP:
+            live_name   = entry[0]
+            preset_name = entry[slot_idx]
+            kw[live_name] = kw[preset_name]
         return FwSettings(**kw)
 
     # ═══════════ Layout ════════════════════════════════════════
@@ -199,30 +254,57 @@ class App(ctk.CTk):
     def _build_transfer_card(self):
         c = ctk.CTkFrame(self, corner_radius=10)
         c.grid(row=1, column=0, sticky="ew", padx=16, pady=(8,8)); c.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(c, text="Firmware (.bin)", font=ctk.CTkFont(size=12, weight="bold")
+
+        # ── Row 0: Target mode selector ────────────────────────────
+        ctk.CTkLabel(c, text="Target", font=ctk.CTkFont(size=12, weight="bold")
                      ).grid(row=0, column=0, padx=(16,8), pady=(14,4), sticky="w")
+        tf = ctk.CTkFrame(c, fg_color="transparent")
+        tf.grid(row=0, column=1, columnspan=2, sticky="w", pady=(14,4))
+        self.target_seg = ctk.CTkSegmentedButton(tf,
+            values=["S-Board (Bank 2)", "BU via Bank 1"],
+            command=self._on_target_change, height=32)
+        self.target_seg.pack(side="left", padx=(0,8))
+        self.target_hint = tk.StringVar(value="")
+        ctk.CTkLabel(tf, textvariable=self.target_hint, text_color=("#666","#888"),
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(4,0))
+
+        # ── Row 1: bin path + browse ───────────────────────────────
+        ctk.CTkLabel(c, text="Firmware (.bin)", font=ctk.CTkFont(size=12, weight="bold")
+                     ).grid(row=1, column=0, padx=(16,8), pady=(6,4), sticky="w")
         ctk.CTkEntry(c, textvariable=self.vars["bin_path"], height=34
-                     ).grid(row=0, column=1, sticky="ew", pady=(14,4))
+                     ).grid(row=1, column=1, sticky="ew", pady=(6,4))
         ctk.CTkButton(c, text="Browse...", width=90, height=34, command=self._browse
-                      ).grid(row=0, column=2, padx=(8,8), pady=(14,4))
+                      ).grid(row=1, column=2, padx=(8,8), pady=(6,4))
         self.file_info = tk.StringVar(value="")
         ctk.CTkLabel(c, textvariable=self.file_info, text_color=("#666","#888"),
-                     font=ctk.CTkFont(size=11)).grid(row=1, column=1, columnspan=2, sticky="w")
+                     font=ctk.CTkFont(size=11)).grid(row=2, column=1, columnspan=2, sticky="w")
         self.vars["bin_path"].trace_add("write", lambda *_: self._refresh_info())
         self._refresh_info()
+
+        # ── Row 3: version + action buttons ────────────────────────
         ctk.CTkLabel(c, text="Version", font=ctk.CTkFont(size=12, weight="bold")
-                     ).grid(row=2, column=0, padx=(16,8), pady=(8,14), sticky="w")
+                     ).grid(row=3, column=0, padx=(16,8), pady=(8,14), sticky="w")
         ctk.CTkEntry(c, textvariable=self.vars["version"], width=100, height=34
-                     ).grid(row=2, column=1, sticky="w", pady=(8,14))
+                     ).grid(row=3, column=1, sticky="w", pady=(8,14))
         btns = ctk.CTkFrame(c, fg_color="transparent")
-        btns.grid(row=2, column=2, padx=(8,16), pady=(8,14), sticky="e")
+        btns.grid(row=3, column=2, padx=(8,16), pady=(8,14), sticky="e")
         self.abort_btn = ctk.CTkButton(btns, text="Abort", width=90, height=38,
             fg_color=("#b33","#a33"), hover_color=("#d44","#c44"),
             font=ctk.CTkFont(size=13, weight="bold"), command=self._on_abort, state="disabled")
         self.abort_btn.pack(side="right", padx=(8,0))
-        self.send_btn = ctk.CTkButton(btns, text="Send Firmware", width=170, height=38,
+        self.send_btn_text = tk.StringVar(value="Send Firmware")
+        self.send_btn = ctk.CTkButton(btns, textvariable=self.send_btn_text, width=210, height=38,
             font=ctk.CTkFont(size=13, weight="bold"), command=self._on_send)
         self.send_btn.pack(side="right")
+
+        # Initialize the selector to whatever the settings say, then
+        # force the live vars to match the active preset so a
+        # mismatched settings.json (e.g. cmd_can_id from a previous
+        # mode left in the live field) gets reconciled on launch.
+        self.target_seg.set("BU via Bank 1" if self.settings.target_mode == "BU via Bank1"
+                            else "S-Board (Bank 2)")
+        self._load_preset_into_active(self.settings.target_mode)
+        self._refresh_target_labels()
 
     # ═══════════ Tabs ══════════════════════════════════════════
     def _build_tabs(self, parent):
@@ -566,6 +648,102 @@ class App(ctk.CTk):
         d = FwSettings()
         for f in fields(FwSettings): self.vars[f.name].set(getattr(d, f.name))
         self._log_line("[OK] Reset to defaults.\n", "ok")
+        # After resetting we are back in S-Board mode by default — make
+        # sure the live fields match what the user now sees.
+        self.target_seg.set("S-Board (Bank 2)")
+        self._on_target_change("S-Board (Bank 2)")
+
+    # ── Target mode (S-Board self-update vs BU-via-Bank-1) ─────
+    # The Protocol / Header tabs always show the *active* preset.
+    # Switching modes snapshots the current tab values back into the
+    # outgoing preset and loads the incoming one.
+
+    # Field pairs that get swapped between modes. Left = live var name,
+    # Right = (s_*, bu_*) preset names.
+    _TARGET_FIELD_MAP = (
+        ("cmd_can_id",        "s_cmd_can_id",        "bu_cmd_can_id"),
+        ("data_can_id",       "s_data_can_id",       "bu_data_can_id"),
+        ("resp_can_id",       "s_resp_can_id",       "bu_resp_can_id"),
+        ("cmd_fw_start",      "s_cmd_fw_start",      "bu_cmd_fw_start"),
+        ("cmd_fw_header",     "s_cmd_fw_header",     "bu_cmd_fw_header"),
+        ("cmd_fw_complete",   "s_cmd_fw_complete",   "bu_cmd_fw_complete"),
+        ("resp_fw_ack",       "s_resp_fw_ack",       "bu_resp_fw_ack"),
+        ("resp_fw_nak",       "s_resp_fw_nak",       "bu_resp_fw_nak"),
+        ("resp_fw_crc_pass",  "s_resp_fw_crc_pass",  "bu_resp_fw_crc_pass"),
+        ("resp_fw_crc_fail",  "s_resp_fw_crc_fail",  "bu_resp_fw_crc_fail"),
+        ("header_dest_bank",  "s_header_dest_bank",  "bu_header_dest_bank"),
+        ("header_image_type", "s_header_image_type", "bu_header_image_type"),
+    )
+
+    def _stash_active_into(self, mode: str):
+        """Copy the live tab values back into the s_*/bu_* preset slots."""
+        slot = 1 if mode == "S-Board" else 2
+        for live, *presets in self._TARGET_FIELD_MAP:
+            try:
+                v = self.vars[live].get()
+                # IntVar.get() can raise on empty/garbage — fall back to
+                # parsing the string form so we accept "0x18" too.
+                if isinstance(v, str):
+                    v = int(v, 0)
+            except Exception:
+                continue
+            self.vars[presets[slot - 1]].set(v)
+
+    def _load_preset_into_active(self, mode: str):
+        """Copy the s_*/bu_* preset slot values into the live tab vars."""
+        slot = 1 if mode == "S-Board" else 2
+        for live, *presets in self._TARGET_FIELD_MAP:
+            try:
+                v = self.vars[presets[slot - 1]].get()
+            except Exception:
+                continue
+            self.vars[live].set(v)
+
+    def _on_target_change(self, choice: str):
+        """User clicked the segmented Target button."""
+        new_mode = "BU via Bank1" if choice.startswith("BU") else "S-Board"
+        old_mode = self.settings.target_mode
+        if new_mode == old_mode:
+            self._refresh_target_labels()
+            return
+        # Snapshot the values currently on screen back into the OUTGOING
+        # preset so any tweaks the user made survive the swap.
+        self._stash_active_into(old_mode)
+        # Bring the incoming preset's values into the live vars.
+        self._load_preset_into_active(new_mode)
+        # Persist the new mode in BOTH places — the dataclass snapshot
+        # AND the Tk var. _v2s reads the Tk var as the source of truth,
+        # so forgetting this side leaves the send path stuck on the
+        # previous mode regardless of what the segmented button shows.
+        self.settings.target_mode = new_mode
+        self.vars["target_mode"].set(new_mode)
+        self._refresh_target_labels()
+        self._log_line(f"[OK] Target mode → {new_mode}\n", "ok")
+
+    def _refresh_target_labels(self):
+        """Update button label + hint text to reflect the current mode."""
+        mode = self.settings.target_mode
+        if mode == "BU via Bank1":
+            self.send_btn_text.set("Send BU Firmware")
+            try:
+                bank = int(self.vars["header_dest_bank"].get(), 0) \
+                       if isinstance(self.vars["header_dest_bank"].get(), str) \
+                       else int(self.vars["header_dest_bank"].get())
+            except Exception:
+                bank = 0x0A0000
+            self.target_hint.set(
+                f"BU image → S-Board Bank 1 (0x{bank:06X}). "
+                f"Stages on the S-Board; fw_bu_master will push it to a BU board next.")
+        else:
+            self.send_btn_text.set("Send Firmware")
+            try:
+                bank = int(self.vars["header_dest_bank"].get(), 0) \
+                       if isinstance(self.vars["header_dest_bank"].get(), str) \
+                       else int(self.vars["header_dest_bank"].get())
+            except Exception:
+                bank = 0x0C0000
+            self.target_hint.set(
+                f"S-Board self-update → Bank 2 (0x{bank:06X}). Boot manager copies on reset.")
 
     # ═══════════ Log queue ═════════════════════════════════════
     def _log_line(self, text, tag=""):
@@ -608,11 +786,16 @@ class App(ctk.CTk):
             eta = (elapsed/max(pct,1))*(100-pct)
             self.detail_var.set(f"{pct}%  |  {tput:.1f} KB/s  |  ETA {eta:.1f}s")
         line = text.strip()
-        if line.startswith("[START]"): self.state_var.set("Erasing Bank 2..."); self.pb.set(0)
+        bank_label = "Bank 1" if self.settings.target_mode == "BU via Bank1" else "Bank 2"
+        if line.startswith("[START]"): self.state_var.set(f"Erasing {bank_label}..."); self.pb.set(0)
         elif line.startswith("[HEADER]"): self.state_var.set("Sending header...")
         elif line.startswith("[DATA]"): self.state_var.set("Streaming firmware...")
         elif line.startswith("[VERIFY]"): self.state_var.set("Verifying CRC32..."); self.pb.set(1.0)
-        elif "FIRMWARE TRANSFER COMPLETE" in line: self.state_var.set("Done - S-Board resetting."); self.detail_var.set("")
+        elif "FIRMWARE TRANSFER COMPLETE" in line:
+            done = "BU image staged in Bank 1." \
+                if self.settings.target_mode == "BU via Bank1" \
+                else "Done - S-Board resetting."
+            self.state_var.set(done); self.detail_var.set("")
         elif "FAILED" in line and "***" in line: self.state_var.set("Transfer failed."); self.detail_var.set("")
         elif "SUCCESS" in line and "***" in line: self.state_var.set("Transfer complete.")
         elif "ABORTED" in line: self.state_var.set("Transfer aborted."); self.detail_var.set("")
@@ -711,7 +894,8 @@ class App(ctk.CTk):
         self._log_line(f"  Waiting up to {s.erase_timeout}s for ACK...\n", "muted")
         resp = self._manual_wait_resp(timeout=s.erase_timeout)
         if resp and len(resp.data) >= 1 and resp.data[0] == s.resp_fw_ack:
-            self._log_line("  OK - Bank 2 erased, ready to receive.\n", "ok")
+            bank = "Bank 1" if s.target_mode == "BU via Bank1" else "Bank 2"
+            self._log_line(f"  OK - {bank} erased, ready to receive.\n", "ok")
         elif resp and len(resp.data) >= 1:
             self._log_line(f"  Got response 0x{resp.data[0]:02X} (expected ACK 0x{s.resp_fw_ack:02X})\n", "err")
         else:
@@ -788,19 +972,45 @@ class App(ctk.CTk):
         if not self._require_bus(): return
         s = self._v2s()
         self._log_line(f"\n[MANUAL] Step 4: Sending CMD_FW_COMPLETE...\n", "info")
+
+        # Drain any stale frames the data phase may have left behind
+        # (notably a duplicate burst-ACK from a retransmitted partial burst).
+        drained = 0
+        while True:
+            m = self._manual_bus.recv(timeout=0.05)
+            if m is None: break
+            drained += 1
+        if drained:
+            self._log_line(f"  (drained {drained} stale frame(s) before verify)\n", "muted")
+
         self._manual_send_cmd(s.cmd_fw_complete)
         self._log_line(f"  Waiting up to {s.verify_timeout}s...\n", "muted")
-        resp = self._manual_wait_resp(timeout=s.verify_timeout)
+
+        # Filter for a CRC verify result. Skip past any unrelated
+        # frames (e.g. late burst-ACKs) until we either find the
+        # CRC_PASS / CRC_FAIL response or hit the verify timeout.
+        deadline = time.monotonic() + s.verify_timeout
+        resp = None
+        while time.monotonic() < deadline:
+            msg = self._manual_bus.recv(timeout=max(deadline - time.monotonic(), 0.01))
+            if msg is None or msg.arbitration_id != s.resp_can_id:
+                continue
+            if len(msg.data) < 1:
+                continue
+            code = msg.data[0]
+            if code == s.resp_fw_crc_pass or code == s.resp_fw_crc_fail:
+                resp = msg
+                break
+            self._log_line(f"  (ignoring stale 0x{code:02X}, waiting for CRC result)\n", "muted")
+
         if resp and len(resp.data) >= 1:
             code = resp.data[0]
             if code == s.resp_fw_crc_pass:
                 self._log_line("  CRC PASSED - S-Board will write boot flag and reset.\n", "ok")
             elif code == s.resp_fw_crc_fail:
                 self._log_line("  CRC FAILED - data corruption or wrong .bin file.\n", "err")
-            else:
-                self._log_line(f"  Unexpected response: 0x{code:02X}\n", "warn")
         else:
-            self._log_line("  FAIL - No response.\n", "err")
+            self._log_line("  FAIL - No verify response.\n", "err")
 
     def _manual_one_frame(self):
         if not self._require_bus(): return

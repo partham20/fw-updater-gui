@@ -303,18 +303,47 @@ class FirmwareSender:
 
     def send_complete(self):
         print(f"\n[VERIFY] Requesting CRC verification...")
-        print(f"  S-Board will compute CRC32 over Bank 2 and compare with header.")
+        print(f"  S-Board will compute CRC32 over the staging bank.")
         print(f"  Waiting up to {VERIFY_TIMEOUT}s...")
+
+        # Drain any stale frames left in the bus queue from the data
+        # phase (in particular: a duplicate burst-ACK left behind when
+        # the last partial burst hit a retransmission).
+        drained = 0
+        while True:
+            m = self.bus.recv(timeout=0.05)
+            if m is None:
+                break
+            drained += 1
+        if drained:
+            print(f"  (drained {drained} stale frame(s) before verify)")
+
         self.send(build_cmd_frame(CMD_FW_COMPLETE))
 
-        resp = self.wait_response(timeout=VERIFY_TIMEOUT)
+        # Wait specifically for a CRC verify result. Anything else
+        # (late burst-ACK, debug frame, etc.) is logged and ignored.
+        deadline = time.monotonic() + VERIFY_TIMEOUT
+        resp = None
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            msg = self.bus.recv(timeout=max(remaining, 0.001))
+            if msg is None or msg.arbitration_id != RESP_CAN_ID:
+                continue
+            r = parse_response(msg)
+            if r is None:
+                continue
+            if r['cmd'] in (RESP_FW_CRC_PASS, RESP_FW_CRC_FAIL):
+                resp = r
+                break
+            print(f"    (ignoring stale 0x{r['cmd']:02X}, waiting for CRC result)")
+
         if resp is None:
-            print("  FAIL — No response from S-Board")
+            print("  FAIL — No verify response from S-Board")
             return False
         if resp['cmd'] == RESP_FW_CRC_PASS:
             print("  OK — CRC PASSED")
             print("  S-Board will now write boot flag and reset.")
-            print("  Boot manager will copy Bank 2 → Bank 0 on next boot.")
+            print("  Boot manager will copy staging bank → Bank 0 on next boot.")
             return True
         if resp['cmd'] == RESP_FW_CRC_FAIL:
             print("  FAIL — CRC MISMATCH")
