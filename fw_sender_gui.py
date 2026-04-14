@@ -115,6 +115,17 @@ class FwSettings:
     bu_header_dest_bank: int = 0x0A0000
     bu_header_image_type: int = 0x0002
 
+    # ── BU OTA trigger — M-Board -> S-Board "start flashing BU #N" ──
+    # Separate from the staging CAN IDs above: this is the second hop
+    # of the pipeline, when the S-Board already has a verified image
+    # in Bank 1 and needs to push it out to one or more BU boards.
+    bu_trigger_can_id: int = 0x03            # S-Board command channel
+    bu_status_reply_can_id: int = 0x04       # S-Board -> M-Board reply
+    bu_cmd_start_upgrade: int = 0x0E         # CMD_START_BU_FW_UPGRADE
+    bu_cmd_status_request: int = 0x0F        # CMD_BU_FW_STATUS_REQUEST
+    bu_target_id: int = 11                   # last-used target BU (11..22 or 0xFF)
+    bu_auto_poll_ms: int = 1000              # auto-poll period (ms)
+
     def save(self, p=SETTINGS_PATH):
         p.write_text(json.dumps(asdict(self), indent=2))
     @classmethod
@@ -310,10 +321,11 @@ class App(ctk.CTk):
     def _build_tabs(self, parent):
         tabs = ctk.CTkTabview(parent, corner_radius=10)
         tabs.grid(row=0, column=0, sticky="nsew", padx=(0,8))
-        for n in ("Manual Control", "MCU Operations", "CAN Monitor", "CAN Bus", "Protocol", "Timing", "Header", "Settings"):
+        for n in ("Manual Control", "MCU Operations", "BU OTA", "CAN Monitor", "CAN Bus", "Protocol", "Timing", "Header", "Settings"):
             tabs.add(n)
         self._build_manual_tab(tabs.tab("Manual Control"))
         self._build_mcu_tab(tabs.tab("MCU Operations"))
+        self._build_bu_ota_tab(tabs.tab("BU OTA"))
         self._build_monitor_tab(tabs.tab("CAN Monitor"))
         self._build_can_tab(tabs.tab("CAN Bus"))
         self._build_protocol_tab(tabs.tab("Protocol"))
@@ -489,6 +501,400 @@ class App(ctk.CTk):
         self.monitor_text.configure(state="disabled")
         self._monitoring = False
         self._monitor_thread = None
+
+    # ═══════════ BU OTA Trigger tab ═══════════════════════════════
+    # Sends CMD_START_BU_FW_UPGRADE (0x0E) on CAN ID 3 to the S-Board
+    # to kick off streaming of the staged Bank 1 image to a BU board,
+    # and polls CMD_BU_FW_STATUS_REQUEST (0x0F) for progress. Status
+    # replies come back on CAN ID 0x04 with a parsed layout.
+    #
+    # Prerequisite: an image must already be staged into the S-Board
+    # Bank 1 via the "BU via Bank 1" target mode on the main card.
+    _BU_MASTER_STATES = {
+        0: "IDLE",
+        1: "PREPARING",
+        2: "SEND_HEADER",
+        3: "SENDING_DATA",
+        4: "VERIFYING",
+        5: "ACTIVATING",
+        6: "DONE",
+        7: "FAILED",
+    }
+    _BU_MASTER_ERRORS = {
+        0: "NONE",
+        1: "NO_IMAGE",
+        2: "NAK",
+        3: "VERIFY",
+        4: "TIMEOUT",
+        5: "RETRIES_EXHAUSTED",
+    }
+
+    def _build_bu_ota_tab(self, tab):
+        s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        s.pack(fill="both", expand=True)
+        s.grid_columnconfigure(0, weight=1)
+
+        # ── Intro / instructions ──────────────────────────────────
+        self._sec(s, "WHAT THIS DOES").grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        intro = ctk.CTkLabel(
+            s,
+            text=(
+                "Triggers a BU-Board firmware upgrade from an image you\n"
+                "already staged into S-Board Bank 1 (use the main card in\n"
+                "'BU via Bank 1' mode first — the staging must be complete\n"
+                "with CRC PASS before triggering).\n\n"
+                "Steps:\n"
+                "  1. Connect PCAN (Manual Control tab)\n"
+                "  2. Pick target BU id (11..22, or 0xFF for all)\n"
+                "  3. Click 'Trigger Upgrade'\n"
+                "  4. Either poll once or enable auto-poll to watch progress"
+            ),
+            justify="left",
+            text_color=("#888", "#aaa"),
+            font=ctk.CTkFont(size=11),
+        )
+        intro.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        # ── Target selector ──────────────────────────────────────
+        self._sec(s, "TARGET").grid(row=2, column=0, sticky="ew", pady=(8, 6))
+        tf = ctk.CTkFrame(s, corner_radius=8)
+        tf.grid(row=3, column=0, sticky="ew", padx=4, pady=4)
+        tf.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(tf, text="BU board id:", font=ctk.CTkFont(size=12)).grid(
+            row=0, column=0, padx=(10, 4), pady=10, sticky="w"
+        )
+        ctk.CTkEntry(
+            tf,
+            textvariable=self.vars["bu_target_id"],
+            width=90,
+            height=32,
+        ).grid(row=0, column=1, padx=4, pady=10, sticky="w")
+        ctk.CTkLabel(
+            tf,
+            text="(11..22 = single BU   |   0xFF = all sequentially)",
+            text_color=("#888", "#777"),
+            font=ctk.CTkFont(size=10),
+        ).grid(row=0, column=2, padx=(4, 10), pady=10, sticky="w")
+
+        # Quick-pick buttons for common BU ids
+        qp = ctk.CTkFrame(s, fg_color="transparent")
+        qp.grid(row=4, column=0, sticky="ew", padx=4, pady=(0, 4))
+        for i, bid in enumerate(
+            [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 0xFF]
+        ):
+            label = "all" if bid == 0xFF else str(bid)
+            ctk.CTkButton(
+                qp,
+                text=label,
+                width=44,
+                height=28,
+                fg_color=("#444", "#333"),
+                hover_color=("#555", "#444"),
+                command=lambda b=bid: self.vars["bu_target_id"].set(b),
+            ).grid(row=0, column=i, padx=2, pady=2)
+
+        # ── Action buttons ───────────────────────────────────────
+        self._sec(s, "ACTIONS").grid(row=5, column=0, sticky="ew", pady=(14, 6))
+        ab = ctk.CTkFrame(s, fg_color="transparent")
+        ab.grid(row=6, column=0, sticky="ew", padx=4, pady=4)
+        ctk.CTkButton(
+            ab,
+            text="Trigger Upgrade",
+            width=180,
+            height=38,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._bu_trigger_upgrade,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            ab,
+            text="Poll Status",
+            width=140,
+            height=38,
+            command=self._bu_poll_status,
+        ).pack(side="left", padx=(0, 8))
+        self.bu_auto_btn = ctk.CTkButton(
+            ab,
+            text="Start Auto-poll",
+            width=160,
+            height=38,
+            fg_color=("#357", "#357"),
+            hover_color=("#468", "#468"),
+            command=self._bu_auto_poll_toggle,
+        )
+        self.bu_auto_btn.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            ab,
+            text="Abort (send 0x55)",
+            width=150,
+            height=38,
+            fg_color=("#a44", "#a44"),
+            hover_color=("#c55", "#c55"),
+            command=self._bu_abort,
+        ).pack(side="left")
+
+        # ── Status display ───────────────────────────────────────
+        self._sec(s, "STATUS").grid(row=7, column=0, sticky="ew", pady=(14, 6))
+        self.bu_status_state = tk.StringVar(value="(no reply yet)")
+        self.bu_status_error = tk.StringVar(value="")
+        self.bu_status_target = tk.StringVar(value="")
+        self.bu_status_progress = tk.StringVar(value="")
+        self.bu_status_bulk = tk.StringVar(value="")
+        sf = ctk.CTkFrame(s, corner_radius=8)
+        sf.grid(row=8, column=0, sticky="ew", padx=4, pady=4)
+        sf.grid_columnconfigure(1, weight=1)
+        rows = [
+            ("Master state:", self.bu_status_state),
+            ("Error:", self.bu_status_error),
+            ("Target BU:", self.bu_status_target),
+            ("Progress:", self.bu_status_progress),
+            ("Bulk sweep:", self.bu_status_bulk),
+        ]
+        for i, (label, var) in enumerate(rows):
+            ctk.CTkLabel(
+                sf, text=label, anchor="e",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=i, column=0, padx=(10, 6), pady=4, sticky="e")
+            ctk.CTkLabel(
+                sf, textvariable=var, anchor="w",
+                font=ctk.CTkFont(size=12, family="Consolas"),
+            ).grid(row=i, column=1, padx=(0, 10), pady=4, sticky="ew")
+
+        # ── Configurable CAN ids / command codes ─────────────────
+        self._sec(s, "CONFIGURATION (hex OK)").grid(row=9, column=0, sticky="ew", pady=(14, 6))
+        cf = ctk.CTkFrame(s, corner_radius=8)
+        cf.grid(row=10, column=0, sticky="ew", padx=4, pady=4)
+        cf.grid_columnconfigure((0, 1), weight=1)
+        LE(cf, "Trigger CAN ID (M→S)", self.vars["bu_trigger_can_id"],
+           tip="Usually 3 — M-Board command channel.").grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        LE(cf, "Status reply CAN ID (S→M)", self.vars["bu_status_reply_can_id"],
+           tip="Usually 0x04 — FW_BU_STATUS_REPLY_ID in fw_upgrade_config.h.").grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        LE(cf, "Start-upgrade opcode", self.vars["bu_cmd_start_upgrade"],
+           tip="CMD_START_BU_FW_UPGRADE — byte 0 of the command frame.").grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        LE(cf, "Status-request opcode", self.vars["bu_cmd_status_request"],
+           tip="CMD_BU_FW_STATUS_REQUEST — byte 0 of the poll frame.").grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        LE(cf, "Auto-poll period", self.vars["bu_auto_poll_ms"], unit="ms",
+           tip="How often the auto-poll timer sends a status request.").grid(row=2, column=0, padx=4, pady=4, sticky="ew")
+
+        self._bu_auto_poll = False
+        self._bu_auto_poll_job = None
+
+    # ═══════════ BU OTA handlers ══════════════════════════════════
+    def _bu_send_cmd(self, opcode: int, target: int) -> bool:
+        """Send a 64-byte command frame on the configured trigger ID.
+        Frame layout (matches the S-Board main() handler in
+        adc_ex2_soc_epwm.c):
+            byte 0 = opcode (0x0E or 0x0F)
+            byte 1 = target BU id (ignored for status poll)
+            byte 2 = options bitmap (bit0 = continue_on_fail)
+        """
+        if not self._require_bus():
+            return False
+        s = self._v2s()
+        frame = bytearray(64)
+        frame[0] = opcode & 0xFF
+        frame[1] = target & 0xFF
+        frame[2] = 0x01  # default: continue_on_fail
+        msg = can.Message(
+            arbitration_id=s.bu_trigger_can_id,
+            data=bytes(frame),
+            is_extended_id=False,
+            is_fd=True,
+            bitrate_switch=True,
+        )
+        try:
+            self._manual_bus.send(msg)
+            return True
+        except Exception as e:
+            self._log_line(f"[ERROR] BU OTA send failed: {e}\n", "err")
+            return False
+
+    def _bu_wait_status_reply(self, timeout: float = 1.0):
+        """Read frames from the bus until one matches the status reply
+        CAN ID. Other frames are ignored. Returns the parsed dict or
+        None on timeout."""
+        s = self._v2s()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self._manual_bus.recv(
+                timeout=max(deadline - time.monotonic(), 0.01)
+            )
+            if msg is None:
+                continue
+            if msg.arbitration_id != s.bu_status_reply_can_id:
+                continue
+            if len(msg.data) < 15:
+                continue
+            d = msg.data
+            return {
+                "echo":        d[0],
+                "target":      d[1],
+                "state":       d[2],
+                "error":       d[3],
+                "bytes_sent":  d[4] | (d[5] << 8) | (d[6] << 16) | (d[7] << 24),
+                "image_size":  d[8] | (d[9] << 8) | (d[10] << 16) | (d[11] << 24),
+                "last_done":   d[12],
+                "bulk_bitmap": d[13] | (d[14] << 8),
+            }
+        return None
+
+    def _bu_update_status_labels(self, reply):
+        if reply is None:
+            self.bu_status_state.set("(no reply)")
+            self.bu_status_error.set("")
+            self.bu_status_target.set("")
+            self.bu_status_progress.set("")
+            self.bu_status_bulk.set("")
+            return
+        state_name = self._BU_MASTER_STATES.get(
+            reply["state"], f"UNKNOWN({reply['state']})"
+        )
+        err_name = self._BU_MASTER_ERRORS.get(
+            reply["error"], f"UNKNOWN({reply['error']})"
+        )
+        target_txt = (
+            "(idle)" if reply["target"] == 0xFF
+            else f"BU #{reply['target']} (0x{reply['target']:02X})"
+        )
+        self.bu_status_state.set(f"{state_name} (0x{reply['state']:02X})")
+        self.bu_status_error.set(f"{err_name} (0x{reply['error']:02X})")
+        self.bu_status_target.set(target_txt)
+        if reply["image_size"] > 0:
+            pct = reply["bytes_sent"] * 100 / reply["image_size"]
+            self.bu_status_progress.set(
+                f"{reply['bytes_sent']:,} / {reply['image_size']:,} bytes  ({pct:.1f}%)"
+            )
+        else:
+            self.bu_status_progress.set(f"{reply['bytes_sent']:,} bytes")
+        # Bulk bitmap: bit 0 = BU 11, bit 11 = BU 22
+        done_ids = [
+            11 + b for b in range(12) if (reply["bulk_bitmap"] >> b) & 1
+        ]
+        last = (
+            "none" if reply["last_done"] == 0xFF else f"BU #{reply['last_done']}"
+        )
+        self.bu_status_bulk.set(
+            f"last done: {last}   completed: "
+            + (", ".join(f"#{x}" for x in done_ids) if done_ids else "(none)")
+        )
+
+    def _bu_trigger_upgrade(self):
+        try:
+            target = int(self.vars["bu_target_id"].get())
+        except Exception:
+            self._log_line("[ERROR] Invalid BU target id.\n", "err"); return
+        s = self._v2s()
+        self._log_line(
+            f"\n[BU OTA] Trigger upgrade: target=0x{target:02X} "
+            f"(opcode 0x{s.bu_cmd_start_upgrade:02X} on CAN ID "
+            f"0x{s.bu_trigger_can_id:03X})\n",
+            "info",
+        )
+        if not self._bu_send_cmd(s.bu_cmd_start_upgrade, target):
+            return
+        # The S-Board replies with a status frame immediately after
+        # kicking off fw_bu_master. Read it to confirm acceptance.
+        reply = self._bu_wait_status_reply(timeout=1.5)
+        self._bu_update_status_labels(reply)
+        if reply is None:
+            self._log_line(
+                "  No immediate status reply — check connection, "
+                "Bank 1 staging state, or the S-Board firmware build.\n",
+                "warn",
+            )
+        else:
+            self._log_line(
+                f"  Accepted. Master state = "
+                f"{self._BU_MASTER_STATES.get(reply['state'], 'UNKNOWN')}\n",
+                "ok",
+            )
+
+    def _bu_poll_status(self):
+        s = self._v2s()
+        if not self._bu_send_cmd(s.bu_cmd_status_request, 0):
+            return
+        reply = self._bu_wait_status_reply(timeout=1.0)
+        self._bu_update_status_labels(reply)
+        if reply is None:
+            self._log_line("[BU OTA] Poll: no reply.\n", "warn")
+        else:
+            state = self._BU_MASTER_STATES.get(reply["state"], "UNKNOWN")
+            self._log_line(
+                f"[BU OTA] Poll: {state} "
+                f"target=0x{reply['target']:02X} "
+                f"bytes={reply['bytes_sent']}/{reply['image_size']}\n",
+                "muted",
+            )
+
+    def _bu_auto_poll_toggle(self):
+        if self._bu_auto_poll:
+            self._bu_auto_poll = False
+            self.bu_auto_btn.configure(
+                text="Start Auto-poll",
+                fg_color=("#357", "#357"),
+                hover_color=("#468", "#468"),
+            )
+            if self._bu_auto_poll_job is not None:
+                try:
+                    self.after_cancel(self._bu_auto_poll_job)
+                except Exception:
+                    pass
+                self._bu_auto_poll_job = None
+            self._log_line("[BU OTA] Auto-poll stopped.\n", "muted")
+        else:
+            if not self._require_bus():
+                return
+            self._bu_auto_poll = True
+            self.bu_auto_btn.configure(
+                text="Stop Auto-poll",
+                fg_color=("#a55", "#a44"),
+                hover_color=("#c66", "#c55"),
+            )
+            self._log_line("[BU OTA] Auto-poll started.\n", "ok")
+            self._bu_auto_poll_tick()
+
+    def _bu_auto_poll_tick(self):
+        if not self._bu_auto_poll:
+            return
+        # Polls happen on the Tk main thread via after(). Safe because
+        # the python-can recv we do inside _bu_poll_status has a short
+        # timeout (<= 1 s) so the UI stays responsive.
+        self._bu_poll_status()
+        if self._bu_auto_poll:
+            try:
+                period = max(100, int(self.vars["bu_auto_poll_ms"].get()))
+            except Exception:
+                period = 1000
+            self._bu_auto_poll_job = self.after(
+                period, self._bu_auto_poll_tick
+            )
+
+    def _bu_abort(self):
+        if not messagebox.askyesno(
+            "Abort BU Upgrade",
+            "Send CMD_BU_FW_ABORT (0x55) as a raw frame on the BU-side\n"
+            "CAN (ID 0x31). This tells whichever BU board is currently\n"
+            "receiving to drop the transfer and resume normal ops.\n\n"
+            "Use this if a BU upgrade is stuck.",
+        ):
+            return
+        if not self._require_bus():
+            return
+        frame = bytearray(64)
+        frame[0] = 0x55  # BU_CMD_FW_ABORT
+        frame[1] = 0xFF  # broadcast target
+        try:
+            self._manual_bus.send(
+                can.Message(
+                    arbitration_id=0x31,
+                    data=bytes(frame),
+                    is_extended_id=False,
+                    is_fd=True,
+                    bitrate_switch=True,
+                )
+            )
+            self._log_line("[BU OTA] Sent ABORT (0x55) on ID 0x31.\n", "ok")
+        except Exception as e:
+            self._log_line(f"[BU OTA] ABORT send failed: {e}\n", "err")
 
     def _build_can_tab(self, tab):
         s = ctk.CTkScrollableFrame(tab, fg_color="transparent")
