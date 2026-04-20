@@ -368,6 +368,39 @@ class App(ctk.CTk):
         ctk.CTkLabel(cf, textvariable=self.conn_status, text_color=("#a33","#f66"),
                      font=ctk.CTkFont(size=12)).pack(side="left", padx=12)
 
+        # ────────────────────────────────────────────────────────
+        # FW UPDATE MODE — system-wide ENTER / EXIT / STATUS
+        # ────────────────────────────────────────────────────────
+        self._sec(s, "FW UPDATE MODE").grid(row=100, column=0, sticky="ew", pady=(14, 6))
+        fwm_info = ctk.CTkLabel(s, text=(
+            "Puts the S-Board and every BU-Board into a quiesced state\n"
+            "before running the OTA protocol below. Exit to resume normal ADC work."),
+            text_color=("#888", "#aaa"), font=ctk.CTkFont(size=11), justify="left")
+        fwm_info.grid(row=101, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        fwm_steps = [
+            ("Enter FW Mode",   "CMD_ENTER_FW_MODE (0x3C) on cmd-id. S-Board stops ePWM/DMA\n"
+                                 "and fans out to BU-Boards.",
+             self._fw_mode_enter),
+            ("Exit FW Mode",    "CMD_EXIT_FW_MODE (0x3D). S-Board re-enables ADC, resumes\n"
+                                 "normal voltage/power cycle. Fans out to BU-Boards.",
+             self._fw_mode_exit),
+            ("Request Status",  "CMD_FW_STATUS_REQ (0x3E). S-Board polls every BU-Board\n"
+                                 "for RESP_FW_RESULT and returns RESP_FW_SUMMARY.",
+             self._fw_mode_status),
+        ]
+        for i, (title, desc, cmd) in enumerate(fwm_steps):
+            row = 102 + i
+            bf = ctk.CTkFrame(s, corner_radius=8)
+            bf.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
+            bf.grid_columnconfigure(1, weight=1)
+            ctk.CTkButton(bf, text=title, width=200, height=36, command=cmd,
+                          font=ctk.CTkFont(size=12, weight="bold")).grid(
+                              row=0, column=0, padx=10, pady=10, sticky="w")
+            ctk.CTkLabel(bf, text=desc, justify="left", text_color=("#666", "#aaa"),
+                         font=ctk.CTkFont(size=11), wraplength=350).grid(
+                row=0, column=1, padx=(0, 10), pady=10, sticky="w")
+
         self._sec(s, "STEP-BY-STEP OTA").grid(row=2, column=0, sticky="ew", pady=(14,6))
         info = ctk.CTkLabel(s, text=(
             "Run each step individually. The S-Board responds on CAN.\n"
@@ -1840,6 +1873,78 @@ class App(ctk.CTk):
             self._log_line(f"  Got response 0x{resp.data[0]:02X} (expected ACK 0x{s.resp_fw_ack:02X})\n", "err")
         else:
             self._log_line("  FAIL - No response.\n", "err")
+
+    # ── FW UPDATE MODE controls ───────────────────────────────
+    CMD_ENTER_FW_MODE   = 0x3C
+    CMD_EXIT_FW_MODE    = 0x3D
+    CMD_FW_STATUS_REQ   = 0x3E
+    RESP_FW_SUMMARY     = 0x40
+    RESP_FW_RESULT      = 0x41
+
+    def _fw_mode_enter(self):
+        if not self._require_bus(): return
+        self._log_line("\n[FW MODE] ENTER (0x3C) — quiesce S-Board + fan out to BUs...\n", "info")
+        self._manual_send_cmd(self.CMD_ENTER_FW_MODE)
+        self._log_line("  Sent. S-Board should stop normal ADC work and start 0x6FE heartbeat.\n", "muted")
+
+    def _fw_mode_exit(self):
+        if not self._require_bus(): return
+        self._log_line("\n[FW MODE] EXIT (0x3D) — resume normal app on all boards...\n", "info")
+        self._manual_send_cmd(self.CMD_EXIT_FW_MODE)
+        self._log_line("  Sent. System should return to normal ADC/voltage/power cycle.\n", "muted")
+
+    def _fw_mode_status(self):
+        """Send STATUS_REQ, collect RESP_FW_SUMMARY and RESP_FW_RESULT frames
+        for a short window, print a table."""
+        if not self._require_bus(): return
+        s = self._v2s()
+        self._log_line("\n[FW MODE] STATUS REQUEST (0x3E) — polling S + BU boards...\n", "info")
+        self._manual_send_cmd(self.CMD_FW_STATUS_REQ)
+
+        deadline = time.monotonic() + 3.0
+        summary = None
+        results = {}     # keyed by bu_id
+        while time.monotonic() < deadline:
+            msg = self._manual_bus.recv(
+                timeout=max(deadline - time.monotonic(), 0.01))
+            if msg is None:
+                continue
+            if msg.arbitration_id == s.resp_can_id and \
+               len(msg.data) >= 1 and msg.data[0] == self.RESP_FW_SUMMARY:
+                summary = bytes(msg.data)
+                continue
+            if len(msg.data) >= 12 and msg.data[0] == self.RESP_FW_RESULT:
+                bu_id   = msg.data[1]
+                status  = msg.data[2]
+                version = msg.data[3] | (msg.data[4] << 8)
+                crc     = (msg.data[5] |
+                           (msg.data[6] << 8) |
+                           (msg.data[7] << 16) |
+                           (msg.data[8] << 24))
+                results[bu_id] = (status, version, crc)
+
+        if summary:
+            s_mode = summary[0]
+            num_bu = summary[1]
+            num_ok = summary[2]
+            num_fail = summary[3]
+            s_ver  = summary[4] | (summary[5] << 8)
+            bitmap = summary[6] | (summary[7] << 8)
+            self._log_line(
+                f"  S-Board: mode={'FW' if s_mode else 'NORMAL'}  ver=0x{s_ver:04X}  "
+                f"bu_count={num_bu}  ok={num_ok}  fail={num_fail}  bitmap=0x{bitmap:04X}\n",
+                "ok")
+        else:
+            self._log_line("  (no SUMMARY frame received)\n", "warn")
+
+        if results:
+            for bu_id in sorted(results):
+                st, ver, crc = results[bu_id]
+                self._log_line(
+                    f"    BU {bu_id}: status=0x{st:02X}  ver=0x{ver:04X}  crc32=0x{crc:08X}\n",
+                    "muted")
+        else:
+            self._log_line("    (no individual BU results captured in window)\n", "muted")
 
     def _manual_header(self):
         if not self._require_bus(): return
